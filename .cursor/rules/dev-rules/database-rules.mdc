@@ -1,0 +1,2477 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# データベース設計規則
+
+# データベース・キャッシュ設計規則（CockroachDB v25.2対応）
+
+## CockroachDB v25.2 設計規則
+
+### 概要
+
+CockroachDB v25.2は分散SQLデータベースで、PostgreSQL wire protocol v3.0と互換性があります。PostgreSQL 17相当の機能をサポートしており、従来のPostgreSQLアプリケーションとほぼ同じように使用できますが、分散システム特有の制約と最適化があります。
+
+### CockroachDB と PostgreSQL の互換性
+
+- **PostgreSQL wire protocol v3.0 完全互換**
+- **PostgreSQL 17相当の機能サポート**
+- **ほとんどのPostgreSQL SQL構文をサポート**
+- **PostgreSQL用のドライバー・ORMがそのまま使用可能**
+- **ULID (Universally Unique Lexicographically Sortable Identifier) を主キーとして使用**
+
+### CockroachDB 接続設定
+```go
+// internal/infrastructure/database/cockroachdb.go
+package database
+
+import (
+    "fmt"
+    "time"
+    "github.com/oklog/ulid/v2"
+    "gorm.io/driver/postgres" // CockroachDBはPostgreSQLドライバーを使用
+    "gorm.io/gorm"
+    "gorm.io/gorm/logger"
+)
+
+type Config struct {
+    Host     string
+    Port     int
+    User     string
+    Password string
+    DBName   string
+    SSLMode  string
+    TimeZone string
+    
+    // CockroachDB特有の設定
+    ClusterName string
+    Options     string
+}
+
+func NewCockroachDB(config Config) (*gorm.DB, error) {
+    // CockroachDBはpostgresドライバーを使用（PostgreSQL互換）
+    dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=%s TimeZone=%s",
+        config.Host, config.User, config.Password, config.DBName, config.Port, config.SSLMode, config.TimeZone)
+    
+    // CockroachDB特有のオプションがある場合は追加
+    if config.Options != "" {
+        dsn += "&" + config.Options
+    }
+
+    db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+        Logger: logger.Default.LogMode(logger.Info),
+        NowFunc: func() time.Time {
+            return time.Now().UTC()
+        },
+        // CockroachDB v25.2 最適化設定
+        DisableForeignKeyConstraintWhenMigrating: false, // CockroachDBは外部キーをサポート
+        SkipDefaultTransaction: false, // CockroachDBは分散トランザクションをサポート
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to CockroachDB: %w", err)
+    }
+
+    // CockroachDB 接続プール最適化
+    sqlDB, err := db.DB()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get database instance: %w", err)
+    }
+
+    // CockroachDB v25.2 推奨設定（分散データベース向け）
+    sqlDB.SetMaxIdleConns(10)          // 分散DB向けに控えめ
+    sqlDB.SetMaxOpenConns(100)         // 分散DB向けに適度な値
+    sqlDB.SetConnMaxLifetime(30 * time.Minute) // CockroachDB推奨値
+    sqlDB.SetConnMaxIdleTime(5 * time.Minute)  // より短いアイドル時間
+
+    return db, nil
+}
+```
+
+### CockroachDB マイグレーション管理
+```go
+// migrations/migration.go
+package migrations
+
+import (
+    "webapi-template/internal/domain/entity"
+    "gorm.io/gorm"
+)
+
+func AutoMigrate(db *gorm.DB) error {
+    return db.AutoMigrate(
+        &entity.User{},
+        &entity.Post{},
+        &entity.Category{},
+    )
+}
+
+// CockroachDB対応手動マイグレーション例（ULID使用）
+func Migration001CreateUsersTable(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE TABLE IF NOT EXISTS users (
+            -- ULIDをプライマリキーとして使用（文字列形式）
+            id VARCHAR(26) PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            role VARCHAR(20) DEFAULT 'user',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            deleted_at TIMESTAMP WITH TIME ZONE,
+            
+            -- CockroachDB v25.2では以下のような分散DB向け最適化も可能
+            FAMILY primary (id, name, email, password, role, created_at, updated_at, deleted_at)
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+        CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users(deleted_at);
+        
+        -- CockroachDB特有の統計情報更新（オプション）
+        ANALYZE users;
+    `).Error
+}
+
+// CockroachDB ULID使用例（推奨）
+func Migration002CreatePostsTableWithULID(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE TABLE IF NOT EXISTS posts (
+            id VARCHAR(26) PRIMARY KEY,
+            title VARCHAR(255) NOT NULL,
+            content TEXT,
+            user_id VARCHAR(26) NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            deleted_at TIMESTAMP WITH TIME ZONE,
+            
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            
+            -- CockroachDB column family最適化
+            FAMILY primary (id, title, content, user_id, created_at, updated_at, deleted_at)
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
+        CREATE INDEX IF NOT EXISTS idx_posts_deleted_at ON posts(deleted_at);
+    `).Error
+}
+```
+
+### GORM モデル規則
+
+#### 基本モデル構造
+```go
+// internal/domain/entity/base.go
+package entity
+
+import (
+    "time"
+    "gorm.io/gorm"
+)
+
+// ULID対応基本モデル
+type BaseModel struct {
+    ID        string         `gorm:"type:varchar(26);primaryKey" json:"id"`
+    CreatedAt time.Time      `json:"created_at"`
+    UpdatedAt time.Time      `json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+// バージョン管理付きモデル
+type VersionedModel struct {
+    BaseModel
+    Version int `gorm:"default:1" json:"version"`
+}
+
+// ULID生成ヘルパー
+func (b *BaseModel) BeforeCreate(tx *gorm.DB) error {
+    if b.ID == "" {
+        b.ID = ulid.Make().String()
+    }
+    return nil
+}
+```
+
+#### リレーション定義
+```go
+// One-to-Many
+type User struct {
+    BaseModel
+    Name  string `gorm:"not null" json:"name"`
+    Email string `gorm:"uniqueIndex;not null" json:"email"`
+    
+    // Has Many
+    Posts []Post `gorm:"foreignKey:UserID" json:"posts,omitempty"`
+}
+
+type Post struct {
+    BaseModel
+    Title   string `gorm:"not null" json:"title"`
+    Content string `gorm:"type:text" json:"content"`
+    UserID  string `gorm:"type:varchar(26);not null" json:"user_id"`
+    
+    // Belongs To
+    User User `gorm:"foreignKey:UserID" json:"user,omitempty"`
+    
+    // Many-to-Many
+    Categories []Category `gorm:"many2many:post_categories;" json:"categories,omitempty"`
+}
+
+// Many-to-Many
+type Category struct {
+    BaseModel
+    Name string `gorm:"uniqueIndex;not null" json:"name"`
+    
+    Posts []Post `gorm:"many2many:post_categories;" json:"posts,omitempty"`
+}
+```
+
+#### インデックス定義
+```go
+type User struct {
+    BaseModel
+    Name     string    `gorm:"not null;index:idx_user_name" json:"name"`
+    Email    string    `gorm:"uniqueIndex:idx_user_email;not null" json:"email"`
+    Status   string    `gorm:"type:varchar(20);index:idx_user_status" json:"status"`
+    Birthday time.Time `gorm:"index:idx_user_birthday" json:"birthday"`
+}
+
+// 複合インデックス
+type UserProfile struct {
+    BaseModel
+    UserID   string `gorm:"type:varchar(26);not null;index:idx_user_profile_composite,priority:1" json:"user_id"`
+    Platform string `gorm:"not null;index:idx_user_profile_composite,priority:2" json:"platform"`
+    Handle   string `gorm:"not null" json:"handle"`
+}
+```
+
+### クエリ最適化
+
+#### N+1問題の回避
+```go
+// Bad: N+1問題
+func (r *userRepository) GetUsersWithPosts() ([]*entity.User, error) {
+    var users []*entity.User
+    if err := r.db.Find(&users).Error; err != nil {
+        return nil, err
+    }
+    
+    // 各ユーザーごとにクエリが実行される（N+1問題）
+    for i := range users {
+        r.db.Where("user_id = ?", users[i].ID).Find(&users[i].Posts)
+    }
+    return users, nil
+}
+
+// Good: Preloadで解決
+func (r *userRepository) GetUsersWithPosts() ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.Preload("Posts").Find(&users).Error
+    return users, err
+}
+
+// より細かい制御
+func (r *userRepository) GetUsersWithRecentPosts() ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.Preload("Posts", func(db *gorm.DB) *gorm.DB {
+        return db.Order("created_at DESC").Limit(10)
+    }).Find(&users).Error
+    return users, err
+}
+```
+
+#### 選択的フィールド取得
+```go
+// 必要なフィールドのみ取得
+func (r *userRepository) GetUserSummaries() ([]*UserSummary, error) {
+    var summaries []*UserSummary
+    err := r.db.Model(&entity.User{}).
+        Select("id, name, email, created_at").
+        Find(&summaries).Error
+    return summaries, err
+}
+
+// カウントクエリの最適化
+func (r *userRepository) CountActiveUsers() (int64, error) {
+    var count int64
+    err := r.db.Model(&entity.User{}).
+        Where("status = ?", "active").
+        Count(&count).Error
+    return count, err
+}
+```
+
+## CockroachDB PostgreSQL互換機能
+
+### JSON機能（PostgreSQL互換）
+```sql
+-- CockroachDBでもPostgreSQL互換のJSON機能を使用可能
+CREATE TABLE events (
+    id SERIAL PRIMARY KEY,
+    data JSONB NOT NULL,
+    
+    -- CockroachDB向けColumn Family最適化
+    FAMILY primary (id, data)
+);
+
+-- GORM での JSON フィールド操作（PostgreSQL互換）
+type Event struct {
+    ID   uint           `gorm:"primaryKey" json:"id"`
+    Data datatypes.JSON `gorm:"type:jsonb" json:"data"`
+}
+
+// JSON クエリの例（PostgreSQL互換）
+func (r *eventRepository) FindEventsByType(ctx context.Context, eventType string) ([]*Event, error) {
+    var events []*Event
+    err := r.db.WithContext(ctx).
+        Where("data->>'type' = ?", eventType).
+        Find(&events).Error
+    return events, err
+}
+```
+
+### CockroachDB インデックス最適化
+```go
+// CockroachDBでは効率的なインデックス設計が重要
+type LogEntry struct {
+    ID        string    `gorm:"type:varchar(26);primaryKey" json:"id"`
+    Timestamp time.Time `gorm:"index:idx_log_timestamp" json:"timestamp"`
+    Level     string    `gorm:"index" json:"level"`
+    Message   string    `gorm:"type:text" json:"message"`
+}
+
+// GIN インデックス（PostgreSQL互換でCockroachDBでも使用可能）
+type Document struct {
+    ID       string         `gorm:"type:varchar(26);primaryKey" json:"id"`
+    Content  datatypes.JSON `gorm:"type:jsonb;index:idx_document_content,type:gin" json:"content"`
+    Tags     pq.StringArray `gorm:"type:text[];index:idx_document_tags,type:gin" json:"tags"`
+}
+
+// CockroachDB特有のStoring Index（Covering Index）
+func CreateStoringIndex(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE INDEX idx_documents_with_content 
+        ON documents (created_at DESC) 
+        STORING (id, title, content);
+    `).Error
+}
+```
+
+## Redis 設計規則
+
+### Redis接続設定
+```go
+// internal/infrastructure/cache/redis.go
+package cache
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+    "github.com/go-redis/redis/v8"
+)
+
+type Config struct {
+    Addr     string
+    Password string
+    DB       int
+}
+
+func NewRedisClient(config Config) *redis.Client {
+    rdb := redis.NewClient(&redis.Options{
+        Addr:     config.Addr,
+        Password: config.Password,
+        DB:       config.DB,
+        PoolSize: 10,
+        MinIdleConns: 5,
+    })
+    
+    return rdb
+}
+
+// ヘルスチェック
+func (c *CacheService) Ping(ctx context.Context) error {
+    _, err := c.client.Ping(ctx).Result()
+    return err
+}
+```
+
+### キャッシュサービス実装
+```go
+// internal/infrastructure/cache/cache_service.go
+package cache
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+    "github.com/go-redis/redis/v8"
+)
+
+type CacheService interface {
+    Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
+    Get(ctx context.Context, key string, dest interface{}) error
+    Delete(ctx context.Context, key string) error
+    Exists(ctx context.Context, key string) (bool, error)
+    SetHash(ctx context.Context, key string, field string, value interface{}) error
+    GetHash(ctx context.Context, key string, field string, dest interface{}) error
+    Increment(ctx context.Context, key string) (int64, error)
+    SetExpiration(ctx context.Context, key string, expiration time.Duration) error
+}
+
+type cacheService struct {
+    client *redis.Client
+}
+
+func NewCacheService(client *redis.Client) CacheService {
+    return &cacheService{client: client}
+}
+
+func (c *cacheService) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error {
+    json, err := json.Marshal(value)
+    if err != nil {
+        return fmt.Errorf("failed to marshal value: %w", err)
+    }
+    
+    return c.client.Set(ctx, key, json, expiration).Err()
+}
+
+func (c *cacheService) Get(ctx context.Context, key string, dest interface{}) error {
+    val, err := c.client.Get(ctx, key).Result()
+    if err != nil {
+        if err == redis.Nil {
+            return ErrCacheNotFound
+        }
+        return fmt.Errorf("failed to get cache: %w", err)
+    }
+    
+    if err := json.Unmarshal([]byte(val), dest); err != nil {
+        return fmt.Errorf("failed to unmarshal value: %w", err)
+    }
+    
+    return nil
+}
+```
+
+### キャッシュ戦略
+
+#### キーの命名規則
+```go
+const (
+    // ユーザーキャッシュ
+    UserCacheKey        = "user:%d"           // user:123
+    UserSessionKey      = "session:%s"       // session:uuid
+    UserProfileKey      = "profile:%d"       // profile:123
+    
+    // API制限
+    RateLimitKey        = "rate_limit:%s:%s" // rate_limit:user:123
+    
+    // アプリケーション設定
+    ConfigCacheKey      = "config:%s"        // config:app_settings
+    
+    // 一時データ
+    TempDataKey         = "temp:%s"          // temp:uuid
+    
+    // リスト・集計
+    ActiveUsersKey      = "active_users"
+    DailyStatsKey       = "stats:%s"         // stats:2023-01-01
+)
+
+// キー生成ヘルパー
+func UserKey(userID string) string {
+    return fmt.Sprintf("user:%s", userID)
+}
+
+func RateLimitKey(userID string, action string) string {
+    return fmt.Sprintf("rate_limit:user:%s:%s", userID, action)
+}
+```
+
+#### キャッシュラッパー実装
+```go
+// pkg/cache/wrapper.go
+package cache
+
+import (
+    "context"
+    "time"
+)
+
+type CacheWrapper struct {
+    cache CacheService
+}
+
+func NewCacheWrapper(cache CacheService) *CacheWrapper {
+    return &CacheWrapper{cache: cache}
+}
+
+// Get or Set パターン
+func (w *CacheWrapper) GetOrSet(ctx context.Context, key string, dest interface{}, fetcher func() (interface{}, error), expiration time.Duration) error {
+    // キャッシュから取得を試行
+    err := w.cache.Get(ctx, key, dest)
+    if err == nil {
+        return nil // キャッシュヒット
+    }
+    
+    if err != ErrCacheNotFound {
+        return err // キャッシュエラー
+    }
+    
+    // キャッシュミス時、データを取得
+    data, err := fetcher()
+    if err != nil {
+        return err
+    }
+    
+    // キャッシュに保存
+    if err := w.cache.Set(ctx, key, data, expiration); err != nil {
+        // キャッシュ保存エラーは無視し、データは返す
+        // ログに記録
+    }
+    
+    // データをdestにコピー
+    return copyData(data, dest)
+}
+
+// 使用例
+func (s *userService) GetUser(ctx context.Context, id string) (*entity.User, error) {
+    var user entity.User
+    key := UserKey(id)
+    
+    err := s.cache.GetOrSet(ctx, key, &user, func() (interface{}, error) {
+        return s.userRepo.FindByID(ctx, id)
+    }, 30*time.Minute)
+    
+    return &user, err
+}
+```
+
+### セッション管理
+```go
+// pkg/session/session.go
+package session
+
+import (
+    "context"
+    "crypto/rand"
+    "encoding/hex"
+    "fmt"
+    "time"
+    "webapi-template/internal/infrastructure/cache"
+)
+
+type SessionManager interface {
+    Create(ctx context.Context, userID string) (string, error)
+    Get(ctx context.Context, sessionID string) (*SessionData, error)
+    Update(ctx context.Context, sessionID string, data *SessionData) error
+    Delete(ctx context.Context, sessionID string) error
+    Extend(ctx context.Context, sessionID string) error
+}
+
+type SessionData struct {
+    UserID    string    `json:"user_id"`
+    Email     string    `json:"email"`
+    Role      string    `json:"role"`
+    CreatedAt time.Time `json:"created_at"`
+    LastAccess time.Time `json:"last_access"`
+}
+
+type sessionManager struct {
+    cache      cache.CacheService
+    expiration time.Duration
+}
+
+func NewSessionManager(cache cache.CacheService, expiration time.Duration) SessionManager {
+    return &sessionManager{
+        cache:      cache,
+        expiration: expiration,
+    }
+}
+
+func (s *sessionManager) Create(ctx context.Context, userID string) (string, error) {
+    sessionID, err := generateSessionID()
+    if err != nil {
+        return "", err
+    }
+    
+    sessionData := &SessionData{
+        UserID:     userID,
+        CreatedAt:  time.Now(),
+        LastAccess: time.Now(),
+    }
+    
+    key := fmt.Sprintf("session:%s", sessionID)
+    err = s.cache.Set(ctx, key, sessionData, s.expiration)
+    if err != nil {
+        return "", err
+    }
+    
+    return sessionID, nil
+}
+
+func generateSessionID() (string, error) {
+    bytes := make([]byte, 32)
+    if _, err := rand.Read(bytes); err != nil {
+        return "", err
+    }
+    return hex.EncodeToString(bytes), nil
+}
+```
+
+## データベーストランザクション
+
+### トランザクション管理
+```go
+// pkg/database/transaction.go
+package database
+
+import (
+    "context"
+    "gorm.io/gorm"
+)
+
+type TxManager interface {
+    RunInTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
+type txManager struct {
+    db *gorm.DB
+}
+
+func NewTxManager(db *gorm.DB) TxManager {
+    return &txManager{db: db}
+}
+
+func (tm *txManager) RunInTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+    return tm.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        // トランザクション用のコンテキストを作成
+        txCtx := context.WithValue(ctx, "tx", tx)
+        return fn(txCtx)
+    })
+}
+
+// コンテキストからトランザクションを取得
+func GetTxFromContext(ctx context.Context) *gorm.DB {
+    if tx, ok := ctx.Value("tx").(*gorm.DB); ok {
+        return tx
+    }
+    return nil
+}
+```
+
+### リポジトリでのトランザクション使用
+```go
+func (r *userRepository) Create(ctx context.Context, user *entity.User) error {
+    db := r.db
+    if tx := GetTxFromContext(ctx); tx != nil {
+        db = tx
+    }
+    
+    return db.WithContext(ctx).Create(user).Error
+}
+
+// サービスでの使用例
+func (s *userService) CreateUserWithProfile(ctx context.Context, req CreateUserWithProfileRequest) error {
+    return s.txManager.RunInTransaction(ctx, func(txCtx context.Context) error {
+        // ユーザー作成
+        user := &entity.User{
+            Name:  req.Name,
+            Email: req.Email,
+        }
+        if err := s.userRepo.Create(txCtx, user); err != nil {
+            return err
+        }
+        
+        // プロフィール作成
+        profile := &entity.UserProfile{
+            UserID: user.ID,
+            Bio:    req.Bio,
+        }
+        return s.profileRepo.Create(txCtx, profile)
+    })
+}
+```
+
+## データベース アンチパターン対策
+
+### SQL インジェクション対策
+
+#### ❌ Bad: SQLインジェクションの脆弱性
+```go
+// Bad: 文字列結合によるクエリ構築
+func (r *userRepository) FindByName(name string) ([]*entity.User, error) {
+    var users []*entity.User
+    // 危険：SQLインジェクションの可能性
+    query := fmt.Sprintf("SELECT * FROM users WHERE name = '%s'", name)
+    err := r.db.Raw(query).Scan(&users).Error
+    return users, err
+}
+
+// Bad: 直接的な文字列操作
+func (r *userRepository) Search(searchTerm string) ([]*entity.User, error) {
+    var users []*entity.User
+    sql := "SELECT * FROM users WHERE name LIKE '%" + searchTerm + "%'"
+    err := r.db.Raw(sql).Scan(&users).Error
+    return users, err
+}
+```
+
+#### ✅ Good: パラメータ化クエリの使用
+```go
+// Good: GORMのパラメータ化クエリ
+func (r *userRepository) FindByName(ctx context.Context, name string) ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.WithContext(ctx).Where("name = ?", name).Find(&users).Error
+    return users, err
+}
+
+// Good: 複雑なクエリでもパラメータ化
+func (r *userRepository) Search(ctx context.Context, searchTerm string, status string) ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.WithContext(ctx).
+        Where("name ILIKE ? AND status = ?", "%"+searchTerm+"%", status).
+        Find(&users).Error
+    return users, err
+}
+```
+
+### マジックナンバー・ハードコードの回避
+
+#### ❌ Bad: ハードコードされた値
+```go
+// Bad: マジックナンバー
+func (r *userRepository) GetRecentUsers() ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.Where("created_at > ?", time.Now().AddDate(0, 0, -30)).
+        Limit(100).Find(&users).Error
+    return users, err
+}
+
+// Bad: ハードコードされた設定
+func NewCockroachDB() (*gorm.DB, error) {
+    dsn := "host=localhost user=root password=secret dbname=myapp port=26257 sslmode=require"
+    return gorm.Open(postgres.Open(dsn), &gorm.Config{})
+}
+```
+
+#### ✅ Good: 設定の外部化
+```go
+// Good: 定数を定義
+const (
+    DefaultPageSize     = 20
+    MaxPageSize         = 100
+    RecentDays          = 30
+    DefaultCacheExpiry  = 5 * time.Minute
+)
+
+// 設定構造体の使用
+type DatabaseConfig struct {
+    Host     string `env:"DB_HOST" envDefault:"localhost"`
+    Port     int    `env:"DB_PORT" envDefault:"5432"`
+    User     string `env:"DB_USER" envDefault:"postgres"`
+    Password string `env:"DB_PASSWORD"`
+    DBName   string `env:"DB_NAME"`
+    SSLMode  string `env:"DB_SSLMODE" envDefault:"disable"`
+}
+
+func (r *userRepository) GetRecentUsers(ctx context.Context, days int) ([]*entity.User, error) {
+    if days <= 0 {
+        days = RecentDays
+    }
+    
+    var users []*entity.User
+    cutoffDate := time.Now().AddDate(0, 0, -days)
+    err := r.db.WithContext(ctx).
+        Where("created_at > ?", cutoffDate).
+        Limit(DefaultPageSize).
+        Find(&users).Error
+    return users, err
+}
+```
+
+### カルテシアン積（Cartesian Product）の回避
+
+#### ❌ Bad: 不適切なJOIN
+```go
+// Bad: 複数のHas Manyリレーションを同時にPreload（カルテシアン積）
+func (r *userRepository) GetUsersWithAll() ([]*entity.User, error) {
+    var users []*entity.User
+    // 危険：posts × comments × followersのカルテシアン積が発生
+    err := r.db.Preload("Posts").
+        Preload("Comments").
+        Preload("Followers").
+        Find(&users).Error
+    return users, err
+}
+```
+
+#### ✅ Good: 適切なクエリ分割
+```go
+// Good: 個別にクエリを実行
+func (r *userRepository) GetUsersWithDetails(ctx context.Context, userIDs []string) ([]*entity.User, error) {
+    var users []*entity.User
+    
+    // 基本情報を取得
+    err := r.db.WithContext(ctx).Where("id IN ?", userIDs).Find(&users).Error
+    if err != nil {
+        return nil, err
+    }
+    
+    // 投稿を別途取得
+    var posts []*entity.Post
+    err = r.db.WithContext(ctx).Where("user_id IN ?", userIDs).Find(&posts).Error
+    if err != nil {
+        return nil, err
+    }
+    
+    // usersとpostsをマッピング
+    postMap := make(map[uint][]*entity.Post)
+    for _, post := range posts {
+        postMap[post.UserID] = append(postMap[post.UserID], post)
+    }
+    
+    for i, user := range users {
+        users[i].Posts = postMap[user.ID]
+    }
+    
+    return users, nil
+}
+
+// Good: 必要な分だけPreload
+func (r *userRepository) GetUsersWithPosts(ctx context.Context) ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.WithContext(ctx).
+        Preload("Posts", func(db *gorm.DB) *gorm.DB {
+            return db.Order("created_at DESC").Limit(5)
+        }).
+        Find(&users).Error
+    return users, err
+}
+```
+
+### 過度なインデックス（Over-indexing）の回避
+
+#### ❌ Bad: 不要なインデックス
+```go
+// Bad: すべてのカラムにインデックス
+type User struct {
+    ID        string         `gorm:"type:varchar(26);primaryKey;index" json:"id"`
+    Name      string         `gorm:"index" json:"name"`
+    Email     string         `gorm:"uniqueIndex;index" json:"email"` // 重複
+    Phone     string         `gorm:"index" json:"phone"`             // 検索しない
+    Status    string         `gorm:"index" json:"status"`
+    CreatedAt time.Time      `gorm:"index" json:"created_at"`
+    UpdatedAt time.Time      `gorm:"index" json:"updated_at"`        // 更新時刻は検索しない
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+}
+```
+
+#### ✅ Good: 適切なインデックス設計
+```go
+// Good: 実際の検索パターンに基づくインデックス
+type User struct {
+    ID        string         `gorm:"type:varchar(26);primaryKey" json:"id"`
+    Name      string         `gorm:"not null" json:"name"`
+    Email     string         `gorm:"uniqueIndex;not null" json:"email"`
+    Phone     string         `gorm:"null" json:"phone"`
+    Status    string         `gorm:"index:idx_user_status" json:"status"` // よく検索される
+    CreatedAt time.Time      `json:"created_at"`
+    UpdatedAt time.Time      `json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"` // ソフトデリート用
+}
+
+// 複合インデックスの適切な使用
+type UserProfile struct {
+    UserID     string `gorm:"type:varchar(26);index:idx_user_platform,priority:1" json:"user_id"`
+    Platform   string `gorm:"index:idx_user_platform,priority:2" json:"platform"`
+    Handle     string `json:"handle"`
+    IsVerified bool   `gorm:"index:idx_verified" json:"is_verified"`
+}
+```
+
+### 不適切なトランザクション管理
+
+#### ❌ Bad: トランザクション管理の問題
+```go
+// Bad: トランザクションなしの複数操作
+func (s *userService) CreateUserWithProfile(ctx context.Context, req CreateUserWithProfileRequest) error {
+    user := &entity.User{
+        Name:  req.Name,
+        Email: req.Email,
+    }
+    
+    // 危険：途中で失敗する可能性
+    err := s.userRepo.Create(ctx, user)
+    if err != nil {
+        return err
+    }
+    
+    profile := &entity.UserProfile{
+        UserID: user.ID,
+        Bio:    req.Bio,
+    }
+    
+    // ここで失敗すると整合性が崩れる
+    return s.profileRepo.Create(ctx, profile)
+}
+
+// Bad: 長すぎるトランザクション
+func (s *userService) ProcessUserDataBad(ctx context.Context, userID string) error {
+    return s.db.Transaction(func(tx *gorm.DB) error {
+        // 長時間実行される処理（避けるべき）
+        // 複数テーブルを長時間ロック
+        // バッチ処理をトランザクション内で実行
+        for i := 0; i < 10000; i++ {
+            // 大量処理...
+        }
+        return nil
+    })
+}
+```
+
+#### ✅ Good: 適切なトランザクション管理
+```go
+// Good: 適切なトランザクション使用
+func (s *userService) CreateUserWithProfile(ctx context.Context, req CreateUserWithProfileRequest) error {
+    return s.txManager.RunInTransaction(ctx, func(txCtx context.Context) error {
+        user := &entity.User{
+            Name:  req.Name,
+            Email: req.Email,
+        }
+        
+        err := s.userRepo.Create(txCtx, user)
+        if err != nil {
+            return fmt.Errorf("failed to create user: %w", err)
+        }
+        
+        profile := &entity.UserProfile{
+            UserID: user.ID,
+            Bio:    req.Bio,
+        }
+        
+        err = s.profileRepo.Create(txCtx, profile)
+        if err != nil {
+            return fmt.Errorf("failed to create profile: %w", err)
+        }
+        
+        return nil
+    })
+}
+
+// Good: バッチ処理での適切なトランザクション
+func (s *userService) ProcessUsersInBatches(ctx context.Context) error {
+    const batchSize = 100
+    
+    users, err := s.userRepo.GetUnprocessedUsers(ctx)
+    if err != nil {
+        return err
+    }
+    
+    for i := 0; i < len(users); i += batchSize {
+        end := i + batchSize
+        if end > len(users) {
+            end = len(users)
+        }
+        
+        batch := users[i:end]
+        err := s.processBatch(ctx, batch)
+        if err != nil {
+            return fmt.Errorf("failed to process batch %d-%d: %w", i, end, err)
+        }
+    }
+    
+    return nil
+}
+
+func (s *userService) processBatch(ctx context.Context, users []*entity.User) error {
+    return s.txManager.RunInTransaction(ctx, func(txCtx context.Context) error {
+        for _, user := range users {
+            err := s.processUser(txCtx, user)
+            if err != nil {
+                return fmt.Errorf("failed to process user %d: %w", user.ID, err)
+            }
+        }
+        return nil
+    })
+}
+```
+
+## Kubernetes対応とコンテナ化（APIサーバーのみ）
+
+**重要**: このセクションではAPIサーバーのみをKubernetesにデプロイすることを前提としています。PostgreSQLとRedisは外部サービスとして管理し、Kubernetesクラスター外のマネージドサービス（Amazon RDS、ElastiCache、Google Cloud SQL等）または専用インフラで運用することを想定しています。
+
+### Dockerファイル最適化
+
+#### マルチステージビルド
+```dockerfile
+# Dockerfile
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Go modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# ソースコード
+COPY . .
+
+# ビルド（静的リンク）
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-w -s -X main.version=$(git describe --tags --always)" \
+    -o main cmd/server/main.go
+
+# 実行環境
+FROM alpine:3.18
+
+# セキュリティアップデート & 必要なツール
+RUN apk --no-cache add ca-certificates tzdata
+
+# 非rootユーザー作成
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+
+WORKDIR /app
+
+# バイナリコピー
+COPY --from=builder /app/main .
+COPY --from=builder /app/configs/config.yaml ./configs/
+
+# 権限設定
+RUN chown -R appuser:appgroup /app
+USER appuser
+
+# ヘルスチェック
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ./main healthcheck || exit 1
+
+EXPOSE 8080
+
+CMD ["./main"]
+```
+
+#### .dockerignore 最適化
+```
+# .dockerignore
+.git
+.gitignore
+*.md
+Dockerfile*
+docker-compose*
+.dockerignore
+.env*
+coverage.out
+*.log
+tmp/
+tests/
+docs/
+.cursor/
+.vscode/
+```
+
+### Kubernetes マニフェスト
+
+#### Deployment
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapi-template
+  namespace: default
+  labels:
+    app: webapi-template
+    version: v1.0.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: webapi-template
+  template:
+    metadata:
+      labels:
+        app: webapi-template
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: webapi-template
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+      - name: webapi-template
+        image: webapi-template:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        # 外部データベース接続（マネージドサービス）
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: webapi-template-secrets
+              key: database-url  # 例: postgres://user:pass@rds-instance.region.rds.amazonaws.com:5432/db
+        # 外部Redis接続（マネージドサービス）
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: webapi-template-secrets
+              key: redis-url  # 例: redis://elasticache-cluster.region.cache.amazonaws.com:6379
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: webapi-template-secrets
+              key: jwt-secret
+        # OpenTelemetry設定
+        - name: OTEL_SERVICE_NAME
+          value: "webapi-template"
+        - name: OTEL_SERVICE_VERSION
+          value: "v1.0.0"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://jaeger-collector:14268/api/traces"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: config
+          mountPath: /app/configs
+          readOnly: true
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: config
+        configMap:
+          name: webapi-template-config
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+```
+
+#### Service & Ingress
+```yaml
+# k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapi-template-service
+  namespace: default
+  labels:
+    app: webapi-template
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: webapi-template
+
+---
+# k8s/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapi-template-ingress
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: webapi-template-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: webapi-template-service
+            port:
+              number: 80
+```
+
+#### ConfigMap & Secret
+```yaml
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webapi-template-config
+  namespace: default
+data:
+  config.yaml: |
+    server:
+      port: 8080
+      timeout: 30s
+      shutdown_timeout: 30s
+    
+    database:
+      max_open_conns: 25
+      max_idle_conns: 5
+      conn_max_lifetime: 300s
+    
+    redis:
+      pool_size: 10
+      min_idle_conns: 5
+    
+    logging:
+      level: info
+      format: json
+
+---
+# k8s/secret.yaml (注意: 実際の値は暗号化して管理)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webapi-template-secrets
+  namespace: default
+type: Opaque
+stringData:
+  # 外部マネージドデータベース（例：Amazon RDS）
+  database-url: "postgres://username:password@myapp-db.cluster-xyz.us-west-2.rds.amazonaws.com:5432/webapi_db"
+  # 外部マネージドキャッシュ（例：Amazon ElastiCache）
+  redis-url: "redis://myapp-cache.cluster-xyz.usw2.cache.amazonaws.com:6379/0"
+  jwt-secret: "your-super-secret-jwt-key"
+```
+
+### Health Check 実装
+
+#### Go アプリケーション側
+```go
+// internal/handler/health_handler.go
+package handler
+
+import (
+    "context"
+    "database/sql"
+    "net/http"
+    "time"
+    
+    "github.com/gin-gonic/gin"
+    "github.com/go-redis/redis/v8"
+    "gorm.io/gorm"
+)
+
+type HealthHandler struct {
+    db    *gorm.DB
+    redis *redis.Client
+}
+
+func NewHealthHandler(db *gorm.DB, redis *redis.Client) *HealthHandler {
+    return &HealthHandler{
+        db:    db,
+        redis: redis,
+    }
+}
+
+// Liveness Probe - アプリケーション生存確認
+func (h *HealthHandler) Health(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{
+        "status":    "ok",
+        "timestamp": time.Now().Unix(),
+        "service":   "webapi-template",
+    })
+}
+
+// Readiness Probe - 外部依存関係確認
+func (h *HealthHandler) Ready(c *gin.Context) {
+    ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+    defer cancel()
+
+    status := "ok"
+    statusCode := http.StatusOK
+    checks := make(map[string]interface{})
+
+    // データベース接続確認
+    sqlDB, err := h.db.DB()
+    if err != nil {
+        checks["database"] = map[string]interface{}{
+            "status": "error",
+            "error":  err.Error(),
+        }
+        status = "error"
+        statusCode = http.StatusServiceUnavailable
+    } else {
+        if err := sqlDB.PingContext(ctx); err != nil {
+            checks["database"] = map[string]interface{}{
+                "status": "error",
+                "error":  err.Error(),
+            }
+            status = "error"
+            statusCode = http.StatusServiceUnavailable
+        } else {
+            checks["database"] = map[string]interface{}{
+                "status": "ok",
+            }
+        }
+    }
+
+    // Redis接続確認
+    if err := h.redis.Ping(ctx).Err(); err != nil {
+        checks["redis"] = map[string]interface{}{
+            "status": "error",
+            "error":  err.Error(),
+        }
+        status = "error"
+        statusCode = http.StatusServiceUnavailable
+    } else {
+        checks["redis"] = map[string]interface{}{
+            "status": "ok",
+        }
+    }
+
+    c.JSON(statusCode, gin.H{
+        "status":    status,
+        "timestamp": time.Now().Unix(),
+        "checks":    checks,
+    })
+}
+
+// Startup Probe - 初期化完了確認
+func (h *HealthHandler) Startup(c *gin.Context) {
+    // 初期化に時間がかかる処理の確認
+    // データベースマイグレーション完了など
+    c.JSON(http.StatusOK, gin.H{
+        "status":    "ok",
+        "timestamp": time.Now().Unix(),
+        "message":   "application started successfully",
+    })
+}
+```
+
+### Graceful Shutdown
+
+```go
+// cmd/server/main.go (抜粋)
+package main
+
+import (
+    "context"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+)
+
+func main() {
+    // サーバー初期化
+    router := setupRouter()
+    srv := &http.Server{
+        Addr:    ":8080",
+        Handler: router,
+    }
+
+    // Graceful shutdown設定
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Failed to start server: %v", err)
+        }
+    }()
+
+    // シグナル待機
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+
+    log.Println("Shutting down server...")
+
+    // Graceful shutdown (最大30秒)
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Fatalf("Server forced to shutdown: %v", err)
+    }
+
+    log.Println("Server exited")
+}
+```
+
+### Resource 管理ベストプラクティス
+
+#### Horizontal Pod Autoscaler (HPA)
+```yaml
+# k8s/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webapi-template-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webapi-template
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+#### Pod Disruption Budget
+```yaml
+# k8s/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: webapi-template-pdb
+  namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: webapi-template
+```
+
+### ログとモニタリング統合
+
+#### 構造化ログ（JSON出力）
+```go
+// pkg/logger/logger.go
+package logger
+
+import (
+    "log/slog"
+    "os"
+)
+
+func NewKubernetesLogger() *slog.Logger {
+    // Kubernetes環境向けJSON構造化ログ
+    return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+        Level: slog.LevelInfo,
+        ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+            // Kubernetesログ収集に最適化
+            if a.Key == slog.TimeKey {
+                a.Key = "timestamp"
+            }
+            if a.Key == slog.LevelKey {
+                a.Key = "level"
+                a.Value = slog.StringValue(a.Value.String())
+            }
+            if a.Key == slog.MessageKey {
+                a.Key = "message"
+            }
+            return a
+        },
+    }))
+}
+
+// トレースIDを含むロガー
+func WithTraceID(logger *slog.Logger, traceID string) *slog.Logger {
+    return logger.With("trace_id", traceID)
+}
+```
+
+### 外部データベース接続の高可用性
+
+#### マネージドサービス対応（RDS、Cloud SQL等）
+```go
+// internal/infrastructure/database/postgres_cluster.go
+package database
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "gorm.io/driver/postgres"
+    "gorm.io/gorm"
+    "gorm.io/gorm/logger"
+)
+
+type ClusterConfig struct {
+    WriterDSN        string
+    ReaderDSNs       []string
+    MaxOpenConns     int
+    MaxIdleConns     int
+    ConnMaxLifetime  time.Duration
+    ConnMaxIdleTime  time.Duration
+}
+
+func NewClusterDB(config ClusterConfig) (*gorm.DB, error) {
+    // Writer DB (Primary)
+    writerDB, err := gorm.Open(postgres.Open(config.WriterDSN), &gorm.Config{
+        Logger: logger.Default.LogMode(logger.Silent),
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to writer database: %w", err)
+    }
+
+    // 接続プール設定
+    sqlDB, err := writerDB.DB()
+    if err != nil {
+        return nil, err
+    }
+
+    sqlDB.SetMaxOpenConns(config.MaxOpenConns)
+    sqlDB.SetMaxIdleConns(config.MaxIdleConns)
+    sqlDB.SetConnMaxLifetime(config.ConnMaxLifetime)
+    sqlDB.SetConnMaxIdleTime(config.ConnMaxIdleTime)
+
+    // TODO: Reader DB (Replicas) 設定
+    // 読み取り専用レプリカの接続設定
+
+    return writerDB, nil
+}
+
+// 外部マネージドサービス環境での接続文字列
+func BuildManagedServicePostgresDSN() string {
+    return fmt.Sprintf(
+        "host=%s port=%s user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
+        os.Getenv("POSTGRES_HOST"),     // myapp-db.cluster-xyz.us-west-2.rds.amazonaws.com
+        os.Getenv("POSTGRES_PORT"),     // 5432
+        os.Getenv("POSTGRES_USER"),     // Secret from environment
+        os.Getenv("POSTGRES_PASSWORD"), // Secret from environment
+        os.Getenv("POSTGRES_DB"),       // webapi_db
+        os.Getenv("POSTGRES_SSLMODE"),  // require (external connection)
+        "Asia/Tokyo",
+    )
+}
+```
+
+### 外部サービス管理のベストプラクティス
+
+#### CockroachDB v25.2（マネージドサービス）
+- **推奨サービス**: CockroachDB Cloud、Amazon用CockroachDB、Google Cloud用CockroachDB
+- **設定**:
+  - SSL接続必須（`sslmode=require`）
+  - 自動バックアップ有効（継続的なスナップショット）
+  - Multi-Region展開（分散高可用性）
+  - 適切なクラスターサイズ設定
+  - 接続プールサイズの最適化（分散DB向け）
+  - PostgreSQL互換モード確認
+
+#### Redis（マネージドサービス）
+- **推奨サービス**: Amazon ElastiCache、Google Cloud Memorystore、Azure Cache for Redis
+- **設定**:
+  - 暗号化有効（transit & at rest）
+  - 自動フェイルオーバー設定
+  - 適切なノードサイズ設定
+  - 接続プールサイズの最適化
+
+#### ネットワークセキュリティ
+- VPC内での通信制限
+- セキュリティグループ/ファイアウォールルール設定
+- プライベートサブネット配置
+- IAM/RBAC による認証認可
+
+#### 接続設定例
+```go
+// 外部マネージドサービス向け設定
+type ExternalServiceConfig struct {
+    CockroachDBURL string // "postgres://user:pass@cluster.cockroachlabs.cloud:26257/db?sslmode=require"
+    RedisURL       string // "redis://cache.amazonaws.com:6379/0"
+    
+    // CockroachDB向け接続プール設定
+    MaxOpenConns    int           // 20 (CockroachDB推奨)
+    MaxIdleConns    int           // 5 (推奨)
+    ConnMaxLifetime time.Duration // 5分 (推奨)
+    
+    // SSL設定
+    SSLMode string // "require" (必須)
+}
+```
+
+#### モニタリング・アラート
+- データベース接続数監視
+- レスポンス時間監視
+- エラー率監視
+- リソース使用率監視（CPU、メモリ、ディスク）
+- 自動フェイルオーバー監視
+
+### CockroachDB 特有の最適化
+
+#### 分散データベース特性への対応
+
+CockroachDBは分散データベースのため、従来のPostgreSQLとは異なる考慮事項があります：
+
+```go
+// CockroachDB向けトランザクション実装
+func (s *userService) CreateUserWithRetry(ctx context.Context, req CreateUserRequest) (*entity.User, error) {
+    var user *entity.User
+    var err error
+    
+    // CockroachDBでは競合する可能性のあるトランザクションでRetryが必要
+    for retries := 0; retries < 3; retries++ {
+        err = s.db.Transaction(func(tx *gorm.DB) error {
+            user = &entity.User{
+                Name:  req.Name,
+                Email: req.Email,
+            }
+            
+            if err := tx.Create(user).Error; err != nil {
+                return err
+            }
+            
+            // 関連データも同じトランザクション内で処理
+            profile := &entity.UserProfile{
+                UserID: user.ID, // ULIDが自動で設定される
+                Bio:    req.Bio,
+            }
+            return tx.Create(profile).Error
+        })
+        
+        if err == nil {
+            break
+        }
+        
+        // CockroachDBの競合エラーかチェック
+        if isCockroachRetryError(err) && retries < 2 {
+            time.Sleep(time.Millisecond * time.Duration(100*(retries+1))) // 指数バックオフ
+            continue
+        }
+        
+        return nil, err
+    }
+    
+    return user, nil
+}
+
+func isCockroachRetryError(err error) bool {
+    // CockroachDB特有のリトライエラーをチェック
+    return strings.Contains(err.Error(), "restart transaction") ||
+           strings.Contains(err.Error(), "RETRY_WRITE_TOO_OLD")
+}
+```
+
+#### Column Families 最適化
+
+CockroachDBでは関連するカラムを同じColumn Familyにグループ化することで性能を向上できます：
+
+```go
+// CockroachDB最適化されたテーブル定義
+type User struct {
+    ID        string         `gorm:"type:varchar(26);primaryKey" json:"id"`
+    
+    // Primary Family - よくアクセスされるデータ
+    Name      string         `gorm:"not null" json:"name"`
+    Email     string         `gorm:"uniqueIndex;not null" json:"email"`
+    Status    string         `gorm:"default:'active'" json:"status"`
+    
+    // Audit Family - 監査用データ（別Family推奨）
+    CreatedAt time.Time      `json:"created_at"`
+    UpdatedAt time.Time      `json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+    
+    // Large Data Family - 大きなデータ（別Family推奨）
+    Bio       string         `gorm:"type:text" json:"bio"`
+    Avatar    []byte         `json:"-"`
+}
+
+// CockroachDB向け最適化マイグレーション
+func OptimizedUserTable(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE TABLE users (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            status VARCHAR(20) DEFAULT 'active',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            deleted_at TIMESTAMP WITH TIME ZONE,
+            bio TEXT,
+            avatar BYTES,
+            
+            -- Column Family最適化
+            FAMILY primary (id, name, email, status),
+            FAMILY audit (created_at, updated_at, deleted_at),
+            FAMILY large_data (bio, avatar)
+        );
+    `).Error
+}
+```
+
+#### インデックス最適化
+
+CockroachDBでは適切なインデックス設計が特に重要です：
+
+```go
+// CockroachDB向けインデックス設計（ULID対応）
+type UserQuery struct {
+    BaseModel
+    UserID    string `gorm:"type:varchar(26);index:idx_user_query_composite,priority:1" json:"user_id"`
+    QueryType string `gorm:"index:idx_user_query_composite,priority:2" json:"query_type"`
+    Status    string `gorm:"index:idx_status" json:"status"`
+    
+    // Store covering index - よく一緒に取得されるデータ
+    Result    string `gorm:"index:idx_user_query_composite,priority:3" json:"result"`
+}
+
+// Covering Indexの作成例
+func CreateCoveringIndex(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE INDEX idx_user_queries_covering 
+        ON user_queries (user_id, query_type) 
+        STORING (status, result, created_at);
+    `).Error
+}
+```
+
+#### ULIDの使用（推奨）
+
+CockroachDBでは分散環境でのプライマリキーとしてULIDが最適です。ULIDはタイムスタンプ順序性を持ち、分散システムでのソート性能が優秀です：
+
+```go
+// pkg/ulid/ulid.go
+package ulid
+
+import (
+    "crypto/rand"
+    "time"
+    "github.com/oklog/ulid/v2"
+)
+
+// ULID生成器（スレッドセーフ）
+var entropy = ulid.Monotonic(rand.Reader, 0)
+
+// 新しいULIDを生成
+func New() ulid.ULID {
+    return ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
+}
+
+// ULIDを文字列として生成
+func NewString() string {
+    return New().String()
+}
+
+// ULIDをバイナリとして生成
+func NewBytes() []byte {
+    id := New()
+    return id[:]
+}
+
+// ULIDの検証
+func IsValid(id string) bool {
+    _, err := ulid.Parse(id)
+    return err == nil
+}
+
+// ULID使用のモデル例
+type Post struct {
+    ID        string         `gorm:"type:varchar(26);primary_key" json:"id"`
+    Title     string         `gorm:"not null" json:"title"`
+    Content   string         `gorm:"type:text" json:"content"`
+    UserID    string         `gorm:"type:varchar(26);not null;index" json:"user_id"`
+    CreatedAt time.Time      `json:"created_at"`
+    UpdatedAt time.Time      `json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+    
+    // リレーション
+    User User `gorm:"foreignKey:UserID" json:"user,omitempty"`
+}
+
+// BeforeCreateフックでULID自動生成
+func (p *Post) BeforeCreate(tx *gorm.DB) error {
+    if p.ID == "" {
+        p.ID = NewString()
+    }
+    return nil
+}
+
+// テーブル名の明示
+func (Post) TableName() string {
+    return "posts"
+}
+```
+
+#### 分散クエリ最適化
+
+```go
+// 分散クエリの最適化例
+func (r *postRepository) FindPostsByRegion(ctx context.Context, region string, limit int) ([]*entity.Post, error) {
+    var posts []*entity.Post
+    
+    // CockroachDBでは適切なWHERE句で分散クエリを最適化
+    err := r.db.WithContext(ctx).
+        Where("region = ?", region).
+        Order("created_at DESC").
+        Limit(limit).
+        Preload("User").  // N+1回避
+        Find(&posts).Error
+        
+    return posts, err
+}
+
+// ULID使用時のページネーション（時系列順序保証）
+func (r *postRepository) FindPostsPaginated(ctx context.Context, cursor string, limit int) ([]*entity.Post, string, error) {
+    var posts []*entity.Post
+    
+    query := r.db.WithContext(ctx)
+    if cursor != "" {
+        // ULIDは時系列順序を保持するため、文字列比較で効率的にページネーション
+        query = query.Where("id > ?", cursor)
+    }
+    
+    // ULIDは自然な時系列順序のため、created_atでのソートが不要
+    err := query.Order("id ASC").
+        Limit(limit + 1). // 次のページ存在確認用
+        Find(&posts).Error
+    
+    if err != nil {
+        return nil, "", err
+    }
+    
+    var nextCursor string
+    if len(posts) > limit {
+        nextCursor = posts[limit-1].ID
+        posts = posts[:limit]
+    }
+    
+    return posts, nextCursor, nil
+}
+
+// ULID範囲検索（時間範囲指定）
+func (r *postRepository) FindPostsByTimeRange(ctx context.Context, startTime, endTime time.Time) ([]*entity.Post, error) {
+    var posts []*entity.Post
+    
+    // ULIDから時間範囲のIDを生成
+    startULID := ulid.MustNew(ulid.Timestamp(startTime), nil).String()
+    endULID := ulid.MustNew(ulid.Timestamp(endTime), nil).String()
+    
+    err := r.db.WithContext(ctx).
+        Where("id >= ? AND id <= ?", startULID, endULID).
+        Order("id ASC").
+        Find(&posts).Error
+        
+    return posts, err
+}
+```
+
+## CockroachDB ベストプラクティス（2024年版）
+
+### 1. パフォーマンス最適化
+
+#### ✅ 推奨事項
+
+**クエリ最適化の3つのルール**:
+1. **Rule 1**: 可能な限り少ない行をスキャンする
+2. **Rule 2**: 適切なインデックスを使用する（WHERE句の列にインデックス）
+3. **Rule 3**: 適切な結合タイプを使用する
+
+```go
+// ✅ Good: 効率的なクエリ
+func (r *userRepository) FindActiveUsersByRole(ctx context.Context, role string) ([]*entity.User, error) {
+    var users []*entity.User
+    // Rule 1: 必要な列のみ選択
+    // Rule 2: roleにインデックスが設定されている前提
+    err := r.db.WithContext(ctx).
+        Select("id, name, email, role").
+        Where("role = ? AND status = ?", role, "active").
+        Order("created_at DESC").
+        Find(&users).Error
+    return users, err
+}
+
+// ❌ Bad: 非効率なクエリ
+func (r *userRepository) FindActiveUsersByRoleBad(ctx context.Context, role string) ([]*entity.User, error) {
+    var users []*entity.User
+    // 全列取得、フルテーブルスキャン、ソート処理
+    err := r.db.WithContext(ctx).
+        Find(&users).Error // WHERE句なし = フルスキャン
+    
+    // アプリケーション側でフィルタリング（非効率）
+    var filtered []*entity.User
+    for _, user := range users {
+        if user.Role == role && user.Status == "active" {
+            filtered = append(filtered, user)
+        }
+    }
+    return filtered, err
+}
+```
+
+**バッチ操作の最適化**:
+```go
+// ✅ Good: マルチ行INSERT
+func (r *userRepository) CreateUsersBatch(ctx context.Context, users []*entity.User) error {
+    // 単一のマルチ行INSERTが複数の単一行INSERTより高速
+    return r.db.WithContext(ctx).CreateInBatches(users, 100).Error
+}
+
+// ✅ Good: UPSERTの使用（セカンダリインデックスがない場合）
+func (r *userRepository) UpsertUser(ctx context.Context, user *entity.User) error {
+    // INSERT ON CONFLICTより高速（読み取りを行わない）
+    return r.db.WithContext(ctx).
+        Clauses(clause.OnConflict{
+            Columns:   []clause.Column{{Name: "email"}},
+            DoUpdates: clause.AssignmentColumns([]string{"name", "updated_at"}),
+        }).
+        Create(user).Error
+}
+
+// ❌ Bad: 複数の単一行INSERT
+func (r *userRepository) CreateUsersBad(ctx context.Context, users []*entity.User) error {
+    for _, user := range users {
+        if err := r.db.WithContext(ctx).Create(user).Error; err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+**バッチ削除の最適化**:
+```go
+// ✅ Good: バッチ削除
+func (r *userRepository) DeleteInactiveUsers(ctx context.Context) error {
+    // 大量削除は小さなバッチに分割
+    for {
+        result := r.db.WithContext(ctx).
+            Where("status = ? AND last_login < ?", "inactive", time.Now().AddDate(0, -6, 0)).
+            Limit(1000).
+            Delete(&entity.User{})
+        
+        if result.Error != nil {
+            return result.Error
+        }
+        
+        if result.RowsAffected == 0 {
+            break
+        }
+        
+        // 他のトランザクションに処理時間を与える
+        time.Sleep(100 * time.Millisecond)
+    }
+    return nil
+}
+
+// ✅ Good: 全行削除にはTRUNCATE使用
+func (r *userRepository) TruncateUsers(ctx context.Context) error {
+    return r.db.WithContext(ctx).Exec("TRUNCATE TABLE users").Error
+}
+```
+
+#### ❌ アンチパターン対策
+
+**Sequential Key問題の回避**:
+```go
+// ❌ Bad: 連続するID（ホットスポット発生）
+type BadUser struct {
+    ID   int    `gorm:"primaryKey;autoIncrement" json:"id"` // 避けるべき
+    Name string `json:"name"`
+}
+
+// ✅ Good: ULID使用（分散に最適）
+type User struct {
+    ID   string `gorm:"type:varchar(26);primaryKey" json:"id"` // ULID
+    Name string `json:"name"`
+}
+
+// ULID自動生成
+func (u *User) BeforeCreate(tx *gorm.DB) error {
+    if u.ID == "" {
+        u.ID = ulid.Make().String()
+    }
+    return nil
+}
+```
+
+**Hash-Sharded Indexesの使用**:
+```go
+// 連続キーにインデックスが必要な場合はHash-Sharded Indexを使用
+func CreateHashShardedIndex(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE INDEX idx_users_created_at_hash_sharded 
+        ON users (created_at) 
+        USING HASH WITH BUCKET_COUNT = 8;
+    `).Error
+}
+```
+
+### 2. トランザクション管理とコンテンション対策
+
+#### ✅ 推奨事項
+
+**適切なトランザクション分離レベル**:
+```go
+// CockroachDBのデフォルトはSERIALIZABLE（最高レベル）
+func (s *userService) TransferPoints(ctx context.Context, fromUserID, toUserID string, points int) error {
+    return s.db.Transaction(func(tx *gorm.DB) error {
+        // SELECT FOR UPDATEで早期ロック（コンテンション軽減）
+        var fromUser, toUser entity.User
+        
+        if err := tx.WithContext(ctx).
+            Clauses(clause.Locking{Strength: "UPDATE"}).
+            First(&fromUser, "id = ?", fromUserID).Error; err != nil {
+            return err
+        }
+        
+        if err := tx.WithContext(ctx).
+            Clauses(clause.Locking{Strength: "UPDATE"}).
+            First(&toUser, "id = ?", toUserID).Error; err != nil {
+            return err
+        }
+        
+        if fromUser.Points < points {
+            return errors.New("insufficient points")
+        }
+        
+        // 同じトランザクション内でアップデート
+        fromUser.Points -= points
+        toUser.Points += points
+        
+        if err := tx.Save(&fromUser).Error; err != nil {
+            return err
+        }
+        
+        return tx.Save(&toUser).Error
+    })
+}
+```
+
+**コンテンション軽減策**:
+```go
+// ✅ Good: 小さなトランザクション
+func (s *userService) UpdateUserProfile(ctx context.Context, userID string, profile UpdateProfileRequest) error {
+    // 影響する行数を最小限に抑制
+    return s.db.WithContext(ctx).
+        Model(&entity.User{}).
+        Where("id = ?", userID).
+        Updates(map[string]interface{}{
+            "name":       profile.Name,
+            "bio":        profile.Bio,
+            "updated_at": time.Now(),
+        }).Error
+}
+
+// ❌ Bad: 大きなトランザクション
+func (s *userService) ProcessUserDataBad(ctx context.Context, userID string) error {
+    return s.db.Transaction(func(tx *gorm.DB) error {
+        // 長時間実行される処理（避けるべき）
+        // 複数テーブルを長時間ロック
+        // バッチ処理をトランザクション内で実行
+        for i := 0; i < 10000; i++ {
+            // 大量処理...
+        }
+        return nil
+    })
+}
+```
+
+**Historical Reads（AS OF SYSTEM TIME）の活用**:
+```go
+// ✅ Good: 長時間実行されるレポートクエリ
+func (r *reportRepository) GenerateDailyReport(ctx context.Context, date time.Time) (*DailyReport, error) {
+    var stats struct {
+        TotalUsers  int64
+        ActiveUsers int64
+        TotalPosts  int64
+    }
+    
+    // 過去の時点のデータを読み取り（コンテンション回避）
+    timestamp := date.Format("2006-01-02 15:04:05")
+    
+    err := r.db.WithContext(ctx).
+        Raw(`
+            SELECT 
+                COUNT(*) as total_users,
+                COUNT(CASE WHEN status = 'active' THEN 1 END) as active_users,
+                (SELECT COUNT(*) FROM posts AS OF SYSTEM TIME '`+timestamp+`') as total_posts
+            FROM users AS OF SYSTEM TIME '`+timestamp+`'
+        `).
+        Scan(&stats).Error
+    
+    if err != nil {
+        return nil, err
+    }
+    
+    return &DailyReport{
+        Date:        date,
+        TotalUsers:  stats.TotalUsers,
+        ActiveUsers: stats.ActiveUsers,
+        TotalPosts:  stats.TotalPosts,
+    }, nil
+}
+```
+
+### 3. インデックス設計ベストプラクティス
+
+#### ✅ 推奨事項
+
+**Multi-Column Primary Keysの効果的使用**:
+```go
+// ✅ Good: 複合主キー設計（分散に最適）
+type SocialMediaPost struct {
+    Username      string    `gorm:"primaryKey;size:50" json:"username"`      // 1st: 分散用
+    PostTimestamp time.Time `gorm:"primaryKey" json:"post_timestamp"`        // 2nd: ソート用
+    PostID        string    `gorm:"type:varchar(26)" json:"post_id"`
+    Content       string    `gorm:"type:text" json:"content"`
+    
+    // Column Family最適化
+    FAMILY string `gorm:"-" json:"-"` // primary (username, post_timestamp, post_id, content)
+}
+
+// 効率的なクエリ例
+func (r *postRepository) GetUserRecentPosts(ctx context.Context, username string, limit int) ([]*SocialMediaPost, error) {
+    var posts []*SocialMediaPost
+    // 主キーの順序を活用した効率的クエリ
+    err := r.db.WithContext(ctx).
+        Where("username = ?", username).
+        Order("post_timestamp DESC").
+        Limit(limit).
+        Find(&posts).Error
+    return posts, err
+}
+```
+
+**Covering Indexes（STORING句）の活用**:
+```go
+// ✅ Good: よく使用されるクエリをカバーするインデックス
+func CreateCoveringIndexes(db *gorm.DB) error {
+    // クエリに必要な全列をインデックスに含める
+    return db.Exec(`
+        CREATE INDEX idx_users_email_covering 
+        ON users (email) 
+        STORING (id, name, status, created_at);
+    `).Error
+}
+
+// このクエリはインデックスのみでレスポンス可能（テーブルアクセス不要）
+func (r *userRepository) FindUserByEmailLight(ctx context.Context, email string) (*UserSummary, error) {
+    var user UserSummary
+    err := r.db.WithContext(ctx).
+        Select("id, name, status, created_at").
+        Where("email = ?", email).
+        First(&user).Error
+    return &user, err
+}
+```
+
+**Partial Indexesの活用**:
+```go
+// ✅ Good: 条件付きインデックス（ストレージ効率化）
+func CreatePartialIndexes(db *gorm.DB) error {
+    // アクティブユーザーのみにインデックス
+    return db.Exec(`
+        CREATE INDEX idx_active_users_created_at 
+        ON users (created_at DESC) 
+        WHERE status = 'active';
+    `).Error
+}
+```
+
+#### ❌ アンチパターン対策
+
+**過度なインデックス作成の回避**:
+```go
+// ❌ Bad: 使用されないインデックス
+// CREATE INDEX idx_users_rarely_used ON users (rarely_used_column);
+
+// ✅ Good: インデックス使用状況の監視
+func MonitorIndexUsage(db *gorm.DB) error {
+    var stats []struct {
+        TableName string `json:"table_name"`
+        IndexName string `json:"index_name"`
+        TotalReads int64 `json:"total_reads"`
+    }
+    
+    // CockroachDBの統計情報を確認
+    err := db.Raw(`
+        SELECT 
+            table_name,
+            index_name,
+            total_reads
+        FROM crdb_internal.index_usage_statistics
+        WHERE total_reads = 0
+        AND table_name NOT LIKE 'system.%'
+        ORDER BY table_name, index_name;
+    `).Scan(&stats).Error
+    
+    // 使用されていないインデックスをログ出力
+    for _, stat := range stats {
+        log.Printf("Unused index detected: %s.%s", stat.TableName, stat.IndexName)
+    }
+    
+    return err
+}
+```
+
+### 4. セキュリティベストプラクティス
+
+#### ✅ 推奨事項
+
+**SQL Injection対策**:
+```go
+// ✅ Good: パラメータ化クエリ
+func (r *userRepository) SearchUsers(ctx context.Context, name, email string) ([]*entity.User, error) {
+    var users []*entity.User
+    err := r.db.WithContext(ctx).
+        Where("name ILIKE ? AND email ILIKE ?", "%"+name+"%", "%"+email+"%").
+        Find(&users).Error
+    return users, err
+}
+
+// ❌ Bad: 文字列結合（SQL Injection脆弱性）
+func (r *userRepository) SearchUsersBad(ctx context.Context, name string) ([]*entity.User, error) {
+    var users []*entity.User
+    // 危険: SQLインジェクション可能
+    query := fmt.Sprintf("SELECT * FROM users WHERE name = '%s'", name)
+    err := r.db.WithContext(ctx).Raw(query).Scan(&users).Error
+    return users, err
+}
+```
+
+**Row Level Security（RLS）の活用**:
+```go
+// CockroachDBのRow Level Securityを活用
+func EnableRowLevelSecurity(db *gorm.DB) error {
+    return db.Exec(`
+        ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+        
+        CREATE POLICY user_posts_policy ON posts
+        FOR ALL TO application_user
+        USING (user_id = current_setting('app.current_user_id'));
+    `).Error
+}
+
+// アプリケーションでのユーザーコンテキスト設定
+func (r *postRepository) SetUserContext(ctx context.Context, userID string) error {
+    return r.db.WithContext(ctx).
+        Exec("SET app.current_user_id = ?", userID).Error
+}
+```
+
+### 5. 監視とパフォーマンス分析
+
+#### ✅ 推奨事項
+
+**スロークエリの特定**:
+```go
+// CockroachDBの統計情報を活用したスロークエリ監視
+func (m *Monitor) FindSlowQueries(ctx context.Context) ([]SlowQuery, error) {
+    var queries []SlowQuery
+    
+    err := m.db.WithContext(ctx).Raw(`
+        SELECT 
+            fingerprint_id,
+            query,
+            max_latency,
+            mean_latency,
+            count,
+            total_time
+        FROM crdb_internal.statement_statistics
+        WHERE mean_latency > INTERVAL '100ms'
+        ORDER BY mean_latency DESC
+        LIMIT 20;
+    `).Scan(&queries).Error
+    
+    return queries, err
+}
+
+// EXPLAIN ANALYZEの自動実行
+func (r *userRepository) AnalyzeQuery(ctx context.Context, query string) (*QueryPlan, error) {
+    var plan QueryPlan
+    err := r.db.WithContext(ctx).
+        Raw("EXPLAIN ANALYZE " + query).
+        Scan(&plan).Error
+    return &plan, err
+}
+```
+
+**Hotspot検出**:
+```go
+// レンジ分散状況の監視
+func (m *Monitor) CheckHotspots(ctx context.Context) error {
+    var ranges []struct {
+        RangeID    int64   `json:"range_id"`
+        StartKey   string  `json:"start_key"`
+        EndKey     string  `json:"end_key"`
+        QPS        float64 `json:"qps"`
+        NodeID     int64   `json:"node_id"`
+    }
+    
+    err := m.db.WithContext(ctx).Raw(`
+        SELECT 
+            range_id,
+            start_pretty as start_key,
+            end_pretty as end_key,
+            queries_per_second as qps,
+            lease_holder as node_id
+        FROM crdb_internal.ranges
+        WHERE queries_per_second > 100
+        ORDER BY queries_per_second DESC;
+    `).Scan(&ranges).Error
+    
+    if err != nil {
+        return err
+    }
+    
+    // ホットスポット検出時のアラート
+    for _, r := range ranges {
+        if r.QPS > 1000 {
+            log.Printf("Hotspot detected: Range %d (QPS: %.2f)", r.RangeID, r.QPS)
+        }
+    }
+    
+    return nil
+}
+```
+
+### 6. 運用ベストプラクティス
+
+#### ✅ 推奨事項
+
+**統計情報の定期更新**:
+```go
+// 定期的な統計情報更新（パフォーマンス維持）
+func (m *Maintenance) UpdateTableStatistics(ctx context.Context) error {
+    tables := []string{"users", "posts", "categories", "comments"}
+    
+    for _, table := range tables {
+        if err := m.db.WithContext(ctx).
+            Exec(fmt.Sprintf("ANALYZE %s", table)).Error; err != nil {
+            return fmt.Errorf("failed to analyze table %s: %w", table, err)
+        }
+        
+        log.Printf("Statistics updated for table: %s", table)
+    }
+    
+    return nil
+}
+```
+
+**Connection Pool最適化**:
+```go
+// CockroachDB向け接続プール設定
+func OptimizeConnectionPool(db *gorm.DB) error {
+    sqlDB, err := db.DB()
+    if err != nil {
+        return err
+    }
+    
+    // CockroachDB推奨設定
+    sqlDB.SetMaxIdleConns(10)                    // 分散DB向けに控えめ
+    sqlDB.SetMaxOpenConns(50)                    // ノード数 × 10-20程度
+    sqlDB.SetConnMaxLifetime(30 * time.Minute)  // CockroachDB推奨
+    sqlDB.SetConnMaxIdleTime(5 * time.Minute)   // 短めのアイドル時間
+    
+    return nil
+}
+```
+
+### 7. Migration安全性
+
+#### ✅ 推奨事項
+
+**Online Schema Changes**:
+```go
+// ✅ Good: オンラインスキーマ変更（ダウンタイムなし）
+func SafeAddColumn(db *gorm.DB) error {
+    // CockroachDBは自動的にオンラインスキーマ変更を実行
+    return db.Exec(`
+        ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+    `).Error
+}
+
+// ✅ Good: インデックス作成（バックグラウンド実行）
+func SafeAddIndex(db *gorm.DB) error {
+    return db.Exec(`
+        CREATE INDEX CONCURRENTLY idx_users_phone ON users (phone);
+    `).Error
+}
+
+// ❌ Bad: 大きなテーブルでの列削除（注意が必要）
+// 本番環境では段階的に実行すること
+func UnsafeDropColumn(db *gorm.DB) error {
+    // 大きなテーブルでは時間がかかる可能性
+    return db.Exec(`
+        ALTER TABLE users DROP COLUMN old_column;
+    `).Error
+}
+```
+
+## CockroachDB アンチパターン対策まとめ
+
+### ❌ 避けるべきパターン
+
+1. **Sequential Primary Keys**: `SERIAL`や`AUTO_INCREMENT`の使用
+2. **Large Transactions**: 長時間実行されるトランザクション
+3. **Full Table Scans**: `SELECT *`や`WHERE`句なしのクエリ
+4. **Hot Ranges**: 特定の範囲への書き込み集中
+5. **Unused Indexes**: 使用されないインデックスの蓄積
+6. **String Concatenation in SQL**: SQLインジェクション脆弱性
+
+### ✅ 推奨パターン
+
+1. **ULID/UUID Primary Keys**: 分散に最適なID戦略
+2. **Small Transactions**: 短時間で完了するトランザクション
+3. **Selective Queries**: 必要な列・行のみ取得
+4. **Proper Indexing**: クエリパターンに最適化されたインデックス
+5. **Connection Pooling**: 適切な接続プール管理
+6. **Monitoring**: 継続的なパフォーマンス監視
+

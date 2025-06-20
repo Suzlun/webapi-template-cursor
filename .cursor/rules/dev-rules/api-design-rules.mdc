@@ -1,0 +1,761 @@
+---
+description: "RESTful API設計とHTTPハンドラー実装規則"
+globs: "**/handler/**/*.go,**/api/**/*.go,**/*_handler.go,**/*handler*.go"
+alwaysApply: false
+---
+# API 設計規則
+
+## RESTful API 設計
+
+### URL 設計（ULID対応）
+```
+GET    /api/v1/users           # ユーザー一覧取得
+GET    /api/v1/users/{id}      # ユーザー詳細取得（IDはULID文字列）
+POST   /api/v1/users           # ユーザー作成
+PUT    /api/v1/users/{id}      # ユーザー更新（全フィールド）
+PATCH  /api/v1/users/{id}      # ユーザー部分更新
+DELETE /api/v1/users/{id}      # ユーザー削除
+```
+
+### HTTP ステータスコード
+```
+200 OK              # 成功（GET、PUT、PATCH）
+201 Created          # 作成成功（POST）
+204 No Content       # 成功（DELETE）
+400 Bad Request      # リクエストエラー
+401 Unauthorized     # 認証エラー
+403 Forbidden        # 認可エラー
+404 Not Found        # リソースが存在しない
+409 Conflict         # 重複エラー
+422 Unprocessable Entity  # バリデーションエラー
+500 Internal Server Error  # サーバーエラー
+```
+
+### リクエスト・レスポンス形式（ULID対応）
+
+#### 成功レスポンス（単体）
+```json
+{
+  "data": {
+    "id": "01HWMV5HHQG8WJQH4FN2XZ7J5K",
+    "name": "John Doe",
+    "email": "john@example.com"
+  },
+  "message": "User retrieved successfully"
+}
+```
+
+#### 成功レスポンス（一覧）
+```json
+{
+  "data": [
+    {
+      "id": "01HWMV5HHQG8WJQH4FN2XZ7J5K",
+      "name": "John Doe",
+      "email": "john@example.com"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "page_size": 20,
+    "total_count": 100,
+    "total_pages": 5
+  },
+  "message": "Users retrieved successfully"
+}
+```
+
+#### エラーレスポンス
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Validation failed",
+    "details": [
+      {
+        "field": "email",
+        "message": "Invalid email format"
+      }
+    ]
+  }
+}
+```
+
+### ページング（ULID対応）
+```
+# 通常のページング
+GET /api/v1/users?page=1&page_size=20&sort=created_at&order=desc
+
+# ULIDベースカーソルページング（推奨）
+GET /api/v1/users?cursor=01HWMV5HHQG8WJQH4FN2XZ7J5K&limit=20&order=desc
+```
+
+### フィルタリング
+```
+GET /api/v1/users?name=john&status=active&created_at_gte=2023-01-01
+```
+
+## ミドルウェア
+
+### 必須ミドルウェア
+1. **ログミドルウェア**: 全リクエストをログ出力
+2. **CORSミドルウェア**: CORS設定
+3. **認証ミドルウェア**: JWT検証
+4. **リカバリーミドルウェア**: パニック時の処理
+5. **レート制限ミドルウェア**: API呼び出し制限
+
+### ミドルウェア実装例
+```go
+// ログミドルウェア
+func LoggerMiddleware() gin.HandlerFunc {
+    return gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+        return fmt.Sprintf("[%s] %s %s %d %s %s\n",
+            param.TimeStamp.Format("2006-01-02 15:04:05"),
+            param.Method,
+            param.Path,
+            param.StatusCode,
+            param.Latency,
+            param.ClientIP,
+        )
+    })
+}
+
+// 認証ミドルウェア（ULID対応）
+func AuthMiddleware() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        token := c.GetHeader("Authorization")
+        if token == "" {
+            c.JSON(http.StatusUnauthorized, gin.H{
+                "error": "Authorization header required",
+            })
+            c.Abort()
+            return
+        }
+
+        // JWT検証処理（ULID対応）
+        userID, err := validateJWT(token)
+        if err != nil {
+            c.JSON(http.StatusUnauthorized, gin.H{
+                "error": "Invalid token",
+            })
+            c.Abort()
+            return
+        }
+
+        c.Set("user_id", userID) // userIDはULID文字列
+        c.Next()
+    }
+}
+```
+
+## ハンドラー設計（ULID対応）
+
+### ハンドラー構造
+```go
+type UserHandler struct {
+    service UserService
+    logger  Logger
+}
+
+func NewUserHandler(service UserService, logger Logger) *UserHandler {
+    return &UserHandler{
+        service: service,
+        logger:  logger,
+    }
+}
+
+func (h *UserHandler) GetUser(c *gin.Context) {
+    // 1. パラメータ検証（ULID対応）
+    id := c.Param("id")
+    if !isValidULID(id) {
+        h.logger.Error("Invalid user ID format", "id", id)
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Error: "Invalid user ID format",
+            Code:  "INVALID_PARAMETER",
+        })
+        return
+    }
+
+    // 2. サービス呼び出し
+    user, err := h.service.GetUser(c.Request.Context(), id)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+
+    // 3. レスポンス返却
+    c.JSON(http.StatusOK, SuccessResponse{
+        Data:    user,
+        Message: "User retrieved successfully",
+    })
+}
+
+// ULID検証ヘルパー
+func isValidULID(id string) bool {
+    if len(id) != 26 {
+        return false
+    }
+    _, err := ulid.Parse(id)
+    return err == nil
+}
+
+func (h *UserHandler) handleError(c *gin.Context, err error) {
+    var appErr *AppError
+    if errors.As(err, &appErr) {
+        switch appErr.Code {
+        case "USER_NOT_FOUND":
+            c.JSON(http.StatusNotFound, ErrorResponse{
+                Error: appErr.Message,
+                Code:  appErr.Code,
+            })
+        case "VALIDATION_ERROR":
+            c.JSON(http.StatusBadRequest, ErrorResponse{
+                Error: appErr.Message,
+                Code:  appErr.Code,
+            })
+        default:
+            h.logger.Error("Unknown application error", "error", err)
+            c.JSON(http.StatusInternalServerError, ErrorResponse{
+                Error: "Internal server error",
+                Code:  "INTERNAL_ERROR",
+            })
+        }
+    } else {
+        h.logger.Error("Unexpected error", "error", err)
+        c.JSON(http.StatusInternalServerError, ErrorResponse{
+            Error: "Internal server error",
+            Code:  "INTERNAL_ERROR",
+        })
+    }
+}
+```
+
+### JWT認証（ULID対応）
+```go
+type JWTClaims struct {
+    UserID string `json:"user_id"` // ULID文字列
+    Email  string `json:"email"`
+    jwt.RegisteredClaims
+}
+
+func GenerateJWT(userID string, email string) (string, error) {
+    claims := JWTClaims{
+        UserID: userID,
+        Email:  email,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+        },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString([]byte(os.Getenv("JWT_SECRET")))
+}
+
+func ValidateJWT(tokenString string) (*JWTClaims, error) {
+    token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+        return []byte(os.Getenv("JWT_SECRET")), nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    if claims, ok := token.Claims.(*JWTClaims); ok && token.Valid {
+        return claims, nil
+    }
+
+    return nil, fmt.Errorf("invalid token")
+}
+```
+
+### レスポンス型定義（ULID対応）
+```go
+type SuccessResponse struct {
+    Data    interface{} `json:"data"`
+    Message string      `json:"message,omitempty"`
+}
+
+type PaginatedResponse struct {
+    Data       interface{} `json:"data"`
+    Pagination Pagination  `json:"pagination"`
+    Message    string      `json:"message,omitempty"`
+}
+
+type Pagination struct {
+    Page       int   `json:"page"`
+    PageSize   int   `json:"page_size"`
+    TotalCount int64 `json:"total_count"`
+    TotalPages int   `json:"total_pages"`
+    // ULIDベースカーソルページング用
+    NextCursor *string `json:"next_cursor,omitempty"`
+    PrevCursor *string `json:"prev_cursor,omitempty"`
+}
+
+type ErrorResponse struct {
+    Error   string        `json:"error"`
+    Code    string        `json:"code,omitempty"`
+    Details []ErrorDetail `json:"details,omitempty"`
+}
+
+type ErrorDetail struct {
+    Field   string `json:"field"`
+    Message string `json:"message"`
+}
+
+// ユーザーエンティティ（ULID対応）
+type UserResponse struct {
+    ID      string      `json:"id"`
+    Name    string      `json:"name"`
+    Email   string      `json:"email"`
+    Role    string      `json:"role"`
+    CreatedAt time.Time `json:"created_at"`
+    UpdatedAt time.Time `json:"updated_at"`
+}
+```
+
+### バリデーション
+```go
+// リクエスト構造体
+type CreateUserRequest struct {
+    Name     string `json:"name" binding:"required,min=1,max=100"`
+    Email    string `json:"email" binding:"required,email"`
+    Password string `json:"password" binding:"required,min=8"`
+}
+
+type UpdateUserRequest struct {
+    Name  *string `json:"name,omitempty" binding:"omitempty,min=1,max=100"`
+    Email *string `json:"email,omitempty" binding:"omitempty,email"`
+}
+
+// パス パラメータのバリデーション（ULID対応）
+func ValidatePathParams(c *gin.Context) {
+    userID := c.Param("id")
+    if userID != "" && !isValidULID(userID) {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Error: "Invalid ID format",
+            Code:  "INVALID_PARAMETER",
+        })
+        c.Abort()
+        return
+    }
+    c.Next()
+}
+
+// クエリパラメータのバリデーション
+func ValidateQueryParams(c *gin.Context) {
+    // ページングパラメータ
+    pageStr := c.DefaultQuery("page", "1")
+    page, err := strconv.Atoi(pageStr)
+    if err != nil || page < 1 {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Error: "Invalid page parameter",
+            Code:  "INVALID_PARAMETER",
+        })
+        c.Abort()
+        return
+    }
+
+    // カーソルパラメータ（ULID）
+    cursor := c.Query("cursor")
+    if cursor != "" && !isValidULID(cursor) {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Error: "Invalid cursor format",
+            Code:  "INVALID_PARAMETER",
+        })
+        c.Abort()
+        return
+    }
+
+    c.Set("page", page)
+    c.Set("cursor", cursor)
+    c.Next()
+}
+```
+
+## ルーティング設計
+
+### グループルーティング
+```go
+func SetupRoutes(r *gin.Engine, handlers *Handlers) {
+    // ヘルスチェック
+    r.GET("/health", handlers.Health.Check)
+
+    // API v1
+    v1 := r.Group("/api/v1")
+    {
+        // 認証不要
+        auth := v1.Group("/auth")
+        {
+            auth.POST("/login", handlers.Auth.Login)
+            auth.POST("/register", handlers.Auth.Register)
+        }
+
+        // 認証必要
+        protected := v1.Group("")
+        protected.Use(AuthMiddleware())
+        {
+            // ユーザー管理
+            users := protected.Group("/users")
+            {
+                users.GET("", handlers.User.GetUsers)
+                users.GET("/:id", handlers.User.GetUser)
+                users.POST("", handlers.User.CreateUser)
+                users.PUT("/:id", handlers.User.UpdateUser)
+                users.DELETE("/:id", handlers.User.DeleteUser)
+            }
+
+            // プロフィール
+            profile := protected.Group("/profile")
+            {
+                profile.GET("", handlers.User.GetProfile)
+                profile.PUT("", handlers.User.UpdateProfile)
+            }
+        }
+    }
+}
+```
+
+### ヘルスチェック
+```go
+type HealthHandler struct {
+    db    *gorm.DB
+    redis *redis.Client
+}
+
+func (h *HealthHandler) Check(c *gin.Context) {
+    health := map[string]string{
+        "status": "ok",
+        "timestamp": time.Now().Format(time.RFC3339),
+    }
+
+    // データベース接続チェック
+    if sqlDB, err := h.db.DB(); err != nil || sqlDB.Ping() != nil {
+        health["database"] = "unhealthy"
+        health["status"] = "error"
+    } else {
+        health["database"] = "healthy"
+    }
+
+    // Redis接続チェック
+    if _, err := h.redis.Ping(context.Background()).Result(); err != nil {
+        health["redis"] = "unhealthy"
+        health["status"] = "error"
+    } else {
+        health["redis"] = "healthy"
+    }
+
+    status := http.StatusOK
+    if health["status"] == "error" {
+        status = http.StatusServiceUnavailable
+    }
+
+    c.JSON(status, health)
+}
+```
+
+## セキュリティ
+
+### JWT認証
+```go
+type JWTClaims struct {
+    UserID int    `json:"user_id"`
+    Email  string `json:"email"`
+    jwt.RegisteredClaims
+}
+
+func GenerateJWT(userID int, email string) (string, error) {
+    claims := JWTClaims{
+        UserID: userID,
+        Email:  email,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+            Issuer:    "webapi-template",
+        },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString([]byte(os.Getenv("JWT_SECRET")))
+}
+
+func ValidateJWT(tokenString string) (*JWTClaims, error) {
+    token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
+        return []byte(os.Getenv("JWT_SECRET")), nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    if claims, ok := token.Claims.(*JWTClaims); ok && token.Valid {
+        return claims, nil
+    }
+
+    return nil, errors.New("invalid token")
+}
+```
+
+### レート制限
+```go
+func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
+    limiter := rate.NewLimiter(rate.Every(time.Minute/time.Duration(requestsPerMinute)), requestsPerMinute)
+    
+    return func(c *gin.Context) {
+        if !limiter.Allow() {
+            c.JSON(http.StatusTooManyRequests, gin.H{
+                "error": "Rate limit exceeded",
+            })
+            c.Abort()
+            return
+        }
+        c.Next()
+    }
+}
+```
+
+## API アンチパターン対策
+
+### Chatty API（おしゃべりAPI）の回避
+
+#### ❌ Bad: 過度に細かいAPI
+```go
+// Bad: 複数のAPIコールが必要
+// GET /api/v1/users/123        // ユーザー情報取得
+// GET /api/v1/users/123/posts  // ユーザーの投稿取得  
+// GET /api/v1/users/123/profile // ユーザープロフィール取得
+
+func (h *UserHandler) GetUser(c *gin.Context) {
+    // 基本情報のみ返す
+    user := &UserBasic{
+        ID:   123,
+        Name: "John",
+    }
+    c.JSON(http.StatusOK, user)
+}
+```
+
+#### ✅ Good: 効率的なAPI設計
+```go
+// Good: 必要な情報を一度に取得
+// GET /api/v1/users/123?include=posts,profile
+
+func (h *UserHandler) GetUser(c *gin.Context) {
+    id := c.Param("id")
+    includes := c.Query("include") // "posts,profile"
+    
+    user, err := h.service.GetUserWithIncludes(c.Request.Context(), id, includes)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+    
+    c.JSON(http.StatusOK, user)
+}
+
+// GraphQLライクなレスポンス
+type UserResponse struct {
+    ID      string    `json:"id"`
+    Name    string    `json:"name"`
+    Email   string    `json:"email"`
+    Posts   []*Post   `json:"posts,omitempty"`
+    Profile *Profile  `json:"profile,omitempty"`
+}
+```
+
+### Chunky API（塊API）の回避
+
+#### ❌ Bad: 巨大すぎるレスポンス
+```go
+// Bad: 不要なデータまで含む巨大なレスポンス
+func (h *UserHandler) GetUsers(c *gin.Context) {
+    users, err := h.service.GetAllUsersWithEverything()
+    // 全ユーザーの全情報（投稿、コメント、履歴など）を返す
+    c.JSON(http.StatusOK, users)
+}
+```
+
+#### ✅ Good: ページネーション・フィルタリング
+```go
+// Good: ページネーションとフィールド選択
+func (h *UserHandler) GetUsers(c *gin.Context) {
+    page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+    limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+    fields := c.Query("fields") // "id,name,email"
+    
+    if limit > 100 {
+        limit = 100 // 最大値制限
+    }
+    
+    users, total, err := h.service.GetUsers(c.Request.Context(), page, limit, fields)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+    
+    response := &PaginatedResponse{
+        Data:  users,
+        Total: total,
+        Page:  page,
+        Limit: limit,
+    }
+    
+    c.JSON(http.StatusOK, response)
+}
+```
+
+### RPC風URL の回避
+
+#### ❌ Bad: RPC風のURL設計
+```go
+// Bad: 動詞を含むURL
+// POST /api/v1/createUser
+// POST /api/v1/updateUser
+// POST /api/v1/deleteUser
+// GET  /api/v1/getUsersByStatus
+
+router.POST("/createUser", h.CreateUser)
+router.POST("/updateUser", h.UpdateUser)
+router.POST("/deleteUser", h.DeleteUser)
+router.GET("/getUsersByStatus", h.GetUsersByStatus)
+```
+
+#### ✅ Good: RESTful URL設計
+```go
+// Good: RESTfulなURL
+// POST   /api/v1/users          # ユーザー作成
+// PUT    /api/v1/users/123      # ユーザー更新
+// DELETE /api/v1/users/123      # ユーザー削除
+// GET    /api/v1/users?status=active # ステータスでフィルタ
+
+userGroup := router.Group("/api/v1/users")
+{
+    userGroup.POST("", h.CreateUser)
+    userGroup.GET("", h.GetUsers)               // クエリパラメータでフィルタ
+    userGroup.GET("/:id", h.GetUser)
+    userGroup.PUT("/:id", h.UpdateUser)
+    userGroup.DELETE("/:id", h.DeleteUser)
+}
+```
+
+### セキュリティアンチパターンの回避
+
+#### ❌ Bad: セキュリティ問題
+```go
+// Bad: シークレット情報のハードコード
+const JWT_SECRET = "my-secret-key"
+
+// Bad: エラー情報の過度な露出
+func (h *UserHandler) CreateUser(c *gin.Context) {
+    err := h.service.CreateUser(req)
+    if err != nil {
+        // 内部エラーをそのまま露出
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": err.Error(), // DBエラーなど内部情報が露出
+        })
+        return
+    }
+}
+
+// Bad: 入力値検証なし
+func (h *UserHandler) GetUser(c *gin.Context) {
+    id := c.Param("id")
+    // 数値チェックなし、SQLインジェクションの可能性
+    user, _ := h.service.GetUser(id)
+    c.JSON(http.StatusOK, user)
+}
+```
+
+#### ✅ Good: セキュアな実装
+```go
+// Good: 環境変数からシークレット取得
+func getJWTSecret() []byte {
+    secret := os.Getenv("JWT_SECRET")
+    if secret == "" {
+        log.Fatal("JWT_SECRET environment variable is required")
+    }
+    return []byte(secret)
+}
+
+// Good: エラー情報の適切な制御
+func (h *UserHandler) CreateUser(c *gin.Context) {
+    err := h.service.CreateUser(req)
+    if err != nil {
+        // ログには詳細情報、レスポンスには汎用メッセージ
+        slog.Error("Failed to create user", "error", err, "request_id", getRequestID(c))
+        
+        var appErr *AppError
+        if errors.As(err, &appErr) {
+            c.JSON(mapErrorToStatus(appErr), ErrorResponse{
+                Code:    appErr.Code,
+                Message: appErr.Message, // ユーザー向けメッセージ
+            })
+        } else {
+            c.JSON(http.StatusInternalServerError, ErrorResponse{
+                Code:    "INTERNAL_ERROR",
+                Message: "Internal server error", // 汎用メッセージ
+            })
+        }
+        return
+    }
+}
+
+// Good: 入力値検証
+func (h *UserHandler) GetUser(c *gin.Context) {
+    idStr := c.Param("id")
+    // ULID検証
+    if !isValidULID(idStr) {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Code:    "INVALID_USER_ID",
+            Message: "Invalid user ID format",
+        })
+        return
+    }
+    
+    user, err := h.service.GetUser(c.Request.Context(), idStr)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+    
+    c.JSON(http.StatusOK, user)
+}
+```
+
+### レート制限とスロットリング
+
+#### ✅ Good: 適切なレート制限
+```go
+// レート制限の実装
+func RateLimitMiddleware(requests int, duration time.Duration) gin.HandlerFunc {
+    limiter := make(map[string]*rate.Limiter)
+    mu := sync.RWMutex{}
+    
+    return gin.HandlerFunc(func(c *gin.Context) {
+        ip := c.ClientIP()
+        
+        mu.RLock()
+        limit, exists := limiter[ip]
+        mu.RUnlock()
+        
+        if !exists {
+            mu.Lock()
+            limiter[ip] = rate.NewLimiter(rate.Every(duration), requests)
+            limit = limiter[ip]
+            mu.Unlock()
+        }
+        
+        if !limit.Allow() {
+            c.JSON(http.StatusTooManyRequests, ErrorResponse{
+                Code:    "RATE_LIMIT_EXCEEDED",
+                Message: "Too many requests",
+            })
+            c.Abort()
+            return
+        }
+        
+        c.Next()
+    })
+}
+```
+

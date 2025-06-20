@@ -1,0 +1,1037 @@
+---
+description: "OpenAPI仕様とSwagger実装の規則"
+globs: "**/api/**/*.yaml,**/api/**/*.yml,**/swagger/**/*.go,**/docs/**/*.yaml,**/openapi/**/*,**/*swagger*.go"
+alwaysApply: false
+---
+# OpenAPI 設計規則
+
+## OpenAPI 基本原則
+
+### API ファーストアプローチ
+1. **仕様書を先に書く**: 実装前に OpenAPI 仕様を定義
+2. **コードから生成**: 仕様書からコード骨格を生成
+3. **ドキュメント自動化**: 仕様書から API ドキュメントを自動生成
+4. **バリデーション**: リクエスト/レスポンスの自動検証
+
+### 使用技術スタック
+- **OpenAPI**: 3.0.3+
+- **Swagger**: gin-swagger でドキュメント生成
+- **バリデーション**: go-playground/validator
+- **アノテーション**: swaggo/swag でコード注釈
+
+## OpenAPI 仕様定義
+
+### 基本構造
+```yaml
+# api/openapi.yaml
+openapi: 3.0.3
+info:
+  title: WebAPI Template
+  description: |
+    Clean Architecture ベースの WebAPI テンプレート
+    - CockroachDB v25.2 (PostgreSQL互換)
+    - ULID による ID 管理
+    - JWT 認証
+    - RESTful API 設計
+  version: 1.0.0
+  contact:
+    name: API Support
+    email: support@example.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Development server
+  - url: https://api.example.com/api/v1
+    description: Production server
+
+# セキュリティ設定
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "JWT トークンを Bearer スキームで指定"
+
+  # ULID対応の共通スキーマ
+  schemas:
+    ULID:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      example: "01HWMV5HHQG8WJQH4FN2XZ7J5K"
+      description: "ULID (Universally Unique Lexicographically Sortable Identifier)"
+      
+    User:
+      type: object
+      required:
+        - id
+        - name
+        - email
+        - role
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/ULID'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: "John Doe"
+        email:
+          type: string
+          format: email
+          example: "john@example.com"
+        role:
+          type: string
+          enum: [user, admin]
+          example: "user"
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-01-01T00:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2024-01-01T00:00:00Z"
+
+    CreateUserRequest:
+      type: object
+      required:
+        - name
+        - email
+        - password
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: "John Doe"
+        email:
+          type: string
+          format: email
+          example: "john@example.com"
+        password:
+          type: string
+          minLength: 8
+          example: "password123"
+
+    UpdateUserRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: "John Doe"
+        email:
+          type: string
+          format: email
+          example: "john@example.com"
+
+    # 標準レスポンス
+    SuccessResponse:
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: object
+        message:
+          type: string
+          example: "Operation completed successfully"
+
+    PaginatedResponse:
+      type: object
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        message:
+          type: string
+          example: "Data retrieved successfully"
+
+    Pagination:
+      type: object
+      required:
+        - page
+        - page_size
+        - total_count
+        - total_pages
+      properties:
+        page:
+          type: integer
+          minimum: 1
+          example: 1
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 20
+        total_count:
+          type: integer
+          minimum: 0
+          example: 100
+        total_pages:
+          type: integer
+          minimum: 0
+          example: 5
+        # ULIDベースカーソルページング
+        next_cursor:
+          $ref: '#/components/schemas/ULID'
+        prev_cursor:
+          $ref: '#/components/schemas/ULID'
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          example: "Validation failed"
+        code:
+          type: string
+          example: "VALIDATION_ERROR"
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+
+    ErrorDetail:
+      type: object
+      required:
+        - field
+        - message
+      properties:
+        field:
+          type: string
+          example: "email"
+        message:
+          type: string
+          example: "Invalid email format"
+
+# 共通パラメータ（ULID対応）
+parameters:
+  UserIdPath:
+    name: id
+    in: path
+    required: true
+    schema:
+      $ref: '#/components/schemas/ULID'
+    description: "ユーザーのULID"
+    
+  PageQuery:
+    name: page
+    in: query
+    required: false
+    schema:
+      type: integer
+      minimum: 1
+      default: 1
+    description: "ページ番号"
+    
+  PageSizeQuery:
+    name: page_size
+    in: query
+    required: false
+    schema:
+      type: integer
+      minimum: 1
+      maximum: 100
+      default: 20
+    description: "1ページあたりの件数"
+    
+  CursorQuery:
+    name: cursor
+    in: query
+    required: false
+    schema:
+      $ref: '#/components/schemas/ULID'
+    description: "カーソルページング用のULID"
+
+# 共通レスポンス
+responses:
+  BadRequest:
+    description: "Bad Request"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Invalid request format"
+          code: "INVALID_REQUEST"
+          
+  Unauthorized:
+    description: "Unauthorized"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Authentication required"
+          code: "UNAUTHORIZED"
+          
+  Forbidden:
+    description: "Forbidden"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Access denied"
+          code: "FORBIDDEN"
+          
+  NotFound:
+    description: "Not Found"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Resource not found"
+          code: "NOT_FOUND"
+          
+  Conflict:
+    description: "Conflict"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Resource already exists"
+          code: "CONFLICT"
+          
+  ValidationError:
+    description: "Validation Error"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Validation failed"
+          code: "VALIDATION_ERROR"
+          details:
+            - field: "email"
+              message: "Invalid email format"
+            - field: "password"
+              message: "Password must be at least 8 characters"
+            
+  InternalServerError:
+    description: "Internal Server Error"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+        example:
+          error: "Internal server error"
+          code: "INTERNAL_ERROR"
+
+# パス定義（ULID対応）
+paths:
+  /users:
+    get:
+      summary: "ユーザー一覧取得"
+      description: "ページングまたはカーソルベースでユーザー一覧を取得"
+      tags:
+        - Users
+      parameters:
+        - $ref: '#/components/parameters/PageQuery'
+        - $ref: '#/components/parameters/PageSizeQuery'
+        - $ref: '#/components/parameters/CursorQuery'
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "名前でフィルタリング"
+        - name: email
+          in: query
+          required: false
+          schema:
+            type: string
+            format: email
+          description: "メールアドレスでフィルタリング"
+      responses:
+        '200':
+          description: "ユーザー一覧取得成功"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      summary: "ユーザー作成"
+      description: "新しいユーザーを作成"
+      tags:
+        - Users
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: "ユーザー作成成功"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+                      message:
+                        example: "User created successfully"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /users/{id}:
+    get:
+      summary: "ユーザー詳細取得"
+      description: "指定されたULIDのユーザー詳細を取得"
+      tags:
+        - Users
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '200':
+          description: "ユーザー詳細取得成功"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+                      message:
+                        example: "User retrieved successfully"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    put:
+      summary: "ユーザー更新"
+      description: "指定されたULIDのユーザーを更新"
+      tags:
+        - Users
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: "ユーザー更新成功"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+                      message:
+                        example: "User updated successfully"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    delete:
+      summary: "ユーザー削除"
+      description: "指定されたULIDのユーザーを削除"
+      tags:
+        - Users
+      parameters:
+        - $ref: '#/components/parameters/UserIdPath'
+      responses:
+        '204':
+          description: "ユーザー削除成功"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+tags:
+  - name: Users
+    description: "ユーザー管理API"
+  - name: Auth
+    description: "認証API"
+```
+
+## Go コードでの実装
+
+### Swagger アノテーション
+```go
+// internal/handler/user_handler.go
+package handler
+
+import (
+    "net/http"
+    "strconv"
+    "github.com/gin-gonic/gin"
+    "webapi-template/internal/usecase"
+)
+
+type UserHandler struct {
+    userService usecase.UserService
+}
+
+// GetUsers godoc
+// @Summary Get users list
+// @Description Get paginated list of users
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" minimum(1) default(1)
+// @Param page_size query int false "Page size" minimum(1) maximum(100) default(20)
+// @Param sort query string false "Sort field" Enums(name, email, created_at) default(created_at)
+// @Param order query string false "Sort order" Enums(asc, desc) default(desc)
+// @Success 200 {object} UsersListResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /users [get]
+// @Security BearerAuth
+func (h *UserHandler) GetUsers(c *gin.Context) {
+    // パラメータ解析
+    page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+    pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+    
+    // バリデーション
+    if page < 1 {
+        page = 1
+    }
+    if pageSize < 1 || pageSize > 100 {
+        pageSize = 20
+    }
+    
+    // サービス呼び出し
+    users, total, err := h.userService.GetUsers(c.Request.Context(), pageSize, (page-1)*pageSize)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+    
+    // レスポンス作成
+    totalPages := (int(total) + pageSize - 1) / pageSize
+    response := UsersListResponse{
+        Data: users,
+        Pagination: Pagination{
+            Page:       page,
+            PageSize:   pageSize,
+            TotalCount: total,
+            TotalPages: totalPages,
+        },
+        Message: "Users retrieved successfully",
+    }
+    
+    c.JSON(http.StatusOK, response)
+}
+
+// CreateUser godoc
+// @Summary Create a new user
+// @Description Create a new user with provided data
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param user body CreateUserRequest true "User data"
+// @Success 201 {object} UserResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 409 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /users [post]
+func (h *UserHandler) CreateUser(c *gin.Context) {
+    var req CreateUserRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Error: Error{
+                Code:    "VALIDATION_ERROR",
+                Message: "Invalid request format",
+            },
+        })
+        return
+    }
+    
+    user, err := h.userService.CreateUser(c.Request.Context(), req)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+    
+    c.JSON(http.StatusCreated, UserResponse{
+        Data:    user,
+        Message: "User created successfully",
+    })
+}
+
+// GetUser godoc
+// @Summary Get user by ID
+// @Description Get user details by user ID
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param id path int true "User ID" minimum(1)
+// @Success 200 {object} UserResponse
+// @Failure 400 {object} ErrorResponse
+// @Failure 404 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /users/{id} [get]
+// @Security BearerAuth
+func (h *UserHandler) GetUser(c *gin.Context) {
+    idStr := c.Param("id")
+    if !isValidULID(idStr) {
+        c.JSON(http.StatusBadRequest, ErrorResponse{
+            Error: Error{
+                Code:    "INVALID_PARAMETER",
+                Message: "Invalid user ID format",
+            },
+        })
+        return
+    }
+    
+    user, err := h.userService.GetUser(c.Request.Context(), idStr)
+    if err != nil {
+        h.handleError(c, err)
+        return
+    }
+    
+    c.JSON(http.StatusOK, UserResponse{
+        Data:    user,
+        Message: "User retrieved successfully",
+    })
+}
+```
+
+### レスポンス構造体定義
+```go
+// internal/handler/response.go
+package handler
+
+import "webapi-template/internal/domain/entity"
+
+// UserResponse represents a single user response
+type UserResponse struct {
+    Data    *entity.User `json:"data"`
+    Message string       `json:"message"`
+}
+
+// UsersListResponse represents a list of users response
+type UsersListResponse struct {
+    Data       []*entity.User `json:"data"`
+    Pagination Pagination     `json:"pagination"`
+    Message    string         `json:"message"`
+}
+
+// Pagination represents pagination information
+type Pagination struct {
+    Page       int   `json:"page"`
+    PageSize   int   `json:"page_size"`
+    TotalCount int64 `json:"total_count"`
+    TotalPages int   `json:"total_pages"`
+}
+
+// ErrorResponse represents an error response
+type ErrorResponse struct {
+    Error Error `json:"error"`
+}
+
+// Error represents error details
+type Error struct {
+    Code    string        `json:"code"`
+    Message string        `json:"message"`
+    Details []ErrorDetail `json:"details,omitempty"`
+}
+
+// ErrorDetail represents detailed error information
+type ErrorDetail struct {
+    Field   string `json:"field"`
+    Message string `json:"message"`
+}
+```
+
+### リクエスト構造体定義
+```go
+// internal/handler/request.go
+package handler
+
+// CreateUserRequest represents user creation request
+type CreateUserRequest struct {
+    Name     string `json:"name" binding:"required,min=1,max=100" example:"John Doe"`
+    Email    string `json:"email" binding:"required,email" example:"john@example.com"`
+    Password string `json:"password" binding:"required,min=8" example:"password123"`
+}
+
+// UpdateUserRequest represents user update request
+type UpdateUserRequest struct {
+    Name  *string `json:"name,omitempty" binding:"omitempty,min=1,max=100" example:"John Smith"`
+    Email *string `json:"email,omitempty" binding:"omitempty,email" example:"john.smith@example.com"`
+}
+
+// LoginRequest represents login request
+type LoginRequest struct {
+    Email    string `json:"email" binding:"required,email" example:"john@example.com"`
+    Password string `json:"password" binding:"required" example:"password123"`
+}
+```
+
+## Swagger 設定
+
+### main.go での設定
+```go
+// cmd/server/main.go
+package main
+
+import (
+    "webapi-template/docs"
+    "github.com/gin-gonic/gin"
+    swaggerFiles "github.com/swaggo/files"
+    ginSwagger "github.com/swaggo/gin-swagger"
+)
+
+// @title WebAPI Template
+// @version 1.0
+// @description WebAPI Server Template with Go, gin, GORM
+// @termsOfService http://swagger.io/terms/
+
+// @contact.name API Support
+// @contact.email support@example.com
+
+// @license.name MIT
+// @license.url https://opensource.org/licenses/MIT
+
+// @host localhost:8080
+// @BasePath /api/v1
+
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
+// @description Type "Bearer" followed by a space and JWT token.
+
+func main() {
+    // Swagger の設定
+    docs.SwaggerInfo.Title = "WebAPI Template"
+    docs.SwaggerInfo.Description = "WebAPI Server Template with Go, gin, GORM"
+    docs.SwaggerInfo.Version = "1.0"
+    docs.SwaggerInfo.Host = "localhost:8080"
+    docs.SwaggerInfo.BasePath = "/api/v1"
+    docs.SwaggerInfo.Schemes = []string{"http", "https"}
+    
+    r := gin.Default()
+    
+    // Swagger UI
+    r.GET("/docs/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+    
+    // API routes
+    setupRoutes(r)
+    
+    r.Run(":8080")
+}
+```
+
+### バリデーション設定
+```go
+// pkg/validator/validator.go
+package validator
+
+import (
+    "fmt"
+    "reflect"
+    "strings"
+    "github.com/gin-gonic/gin/binding"
+    "github.com/go-playground/validator/v10"
+)
+
+func SetupValidator() {
+    if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
+        // カスタムバリデーターの登録
+        v.RegisterValidation("username", validateUsername)
+        
+        // JSON タグをフィールド名として使用
+        v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+            name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+            if name == "-" {
+                return ""
+            }
+            return name
+        })
+    }
+}
+
+func validateUsername(fl validator.FieldLevel) bool {
+    username := fl.Field().String()
+    // ユーザー名のカスタムバリデーション
+    return len(username) >= 3 && len(username) <= 20
+}
+
+// バリデーションエラーの変換
+func FormatValidationError(err error) []ErrorDetail {
+    var details []ErrorDetail
+    
+    if validationErrors, ok := err.(validator.ValidationErrors); ok {
+        for _, e := range validationErrors {
+            detail := ErrorDetail{
+                Field:   e.Field(),
+                Message: getErrorMessage(e),
+            }
+            details = append(details, detail)
+        }
+    }
+    
+    return details
+}
+
+func getErrorMessage(e validator.FieldError) string {
+    switch e.Tag() {
+    case "required":
+        return fmt.Sprintf("%s is required", e.Field())
+    case "email":
+        return "Invalid email format"
+    case "min":
+        return fmt.Sprintf("%s must be at least %s characters", e.Field(), e.Param())
+    case "max":
+        return fmt.Sprintf("%s must be at most %s characters", e.Field(), e.Param())
+    default:
+        return fmt.Sprintf("%s is invalid", e.Field())
+    }
+}
+```
+
+## コード生成とドキュメント
+
+### Makefile 設定
+```makefile
+# OpenAPI関連コマンド
+.PHONY: swagger-gen swagger-validate swagger-serve
+
+# Swagger ドキュメント生成
+swagger-gen:
+	swag init -g cmd/server/main.go -o docs
+
+# OpenAPI仕様の検証
+swagger-validate:
+	swagger-codegen validate -i api/openapi.yaml
+
+# Swagger UI をローカルで確認
+swagger-serve:
+	swagger-ui-serve api/openapi.yaml
+
+# API クライアント生成 (オプション)
+generate-client:
+	swagger-codegen generate -i api/openapi.yaml -l go -o client/
+
+# モック生成
+generate-mocks:
+	mockgen -source=internal/usecase/user_service.go -destination=tests/mocks/user_service_mock.go
+```
+
+## ベストプラクティス
+
+### 1. API 設計原則
+
+#### RESTful 設計
+```yaml
+# Good: リソースベース
+GET    /api/v1/users
+POST   /api/v1/users
+GET    /api/v1/users/{id}
+PUT    /api/v1/users/{id}
+DELETE /api/v1/users/{id}
+
+# Bad: 動詞ベース
+GET    /api/v1/getUsers
+POST   /api/v1/createUser
+```
+
+#### 一貫性のあるレスポンス
+```yaml
+# 成功レスポンスは常に同じ構造
+{
+  "data": {},
+  "message": "Success message"
+}
+
+# エラーレスポンスも統一
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Error message",
+    "details": []
+  }
+}
+```
+
+### 2. バージョニング戦略
+
+#### URL パスでのバージョニング
+```yaml
+# 推奨
+/api/v1/users
+/api/v2/users
+
+# 非推奨: ヘッダーでのバージョニング
+# Accept: application/vnd.api+json;version=1
+```
+
+#### 後方互換性の維持
+```yaml
+# 新しいフィールドは optional で追加
+CreateUserRequest:
+  required: [name, email, password]
+  properties:
+    name: {...}
+    email: {...}
+    password: {...}
+    phone: {...}  # 新規フィールドは required に含めない
+```
+
+### 3. セキュリティ考慮
+
+#### 認証情報の除外
+```go
+type User struct {
+    ID       string `json:"id"`
+    Name     string `json:"name"`
+    Email    string `json:"email"`
+    Password string `json:"-"` // レスポンスから除外
+    Role     string `json:"role"`
+}
+```
+
+#### 入力検証の徹底
+```yaml
+# 厳密な型定義
+properties:
+  email:
+    type: string
+    format: email
+    pattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  age:
+    type: integer
+    minimum: 0
+    maximum: 150
+```
+
+### 4. パフォーマンス考慮
+
+#### ページング必須
+```yaml
+parameters:
+  - name: page
+    in: query
+    required: false
+    schema:
+      type: integer
+      minimum: 1
+      default: 1
+  - name: page_size
+    in: query
+    required: false
+    schema:
+      type: integer
+      minimum: 1
+      maximum: 100
+      default: 20
+```
+
+#### フィールド選択の実装
+```yaml
+parameters:
+  - name: fields
+    in: query
+    description: "Comma-separated list of fields to include"
+    schema:
+      type: string
+      example: "id,name,email"
+```
+
+## 継続的インテグレーション
+
+### API 仕様の自動チェック
+```yaml
+# .github/workflows/api-check.yml
+name: API Specification Check
+
+on: [push, pull_request]
+
+jobs:
+  validate-api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Validate OpenAPI
+        uses: APIDevTools/swagger-parser-action@v1
+        with:
+          api-path: api/openapi.yaml
+          
+      - name: Generate docs
+        run: |
+          go install github.com/swaggo/swag/cmd/swag@latest
+          swag init -g cmd/server/main.go -o docs
+          
+      - name: Check if docs are up to date
+        run: |
+          git diff --exit-code docs/
+```
+

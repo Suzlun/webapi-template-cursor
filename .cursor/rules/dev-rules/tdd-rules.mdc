@@ -1,0 +1,745 @@
+---
+description: "TDD（テスト駆動開発）の実践規則"
+globs: "**/*_test.go,**/tests/**/*.go,**/test/**/*.go"
+alwaysApply: false
+---
+# TDD（テスト駆動開発）実践規則
+
+## TDD の基本原則
+
+### Red-Green-Refactor サイクル
+1. **Red**: 失敗するテストを書く
+2. **Green**: テストを通すための最小限のコードを書く
+3. **Refactor**: コードを改善する
+
+### TDD の利点
+- コードの品質向上
+- 設計の改善
+- バグの早期発見
+- リファクタリングの安全性
+- ドキュメント化効果
+
+## TDD 実践手順（ULID対応）
+
+### Step 1: テストファースト
+
+#### インターフェース定義（ULID対応）
+```go
+// internal/usecase/user_service.go
+package usecase
+
+import (
+    "context"
+    "webapi-template/internal/domain/entity"
+)
+
+// まずインターフェースを定義
+type UserService interface {
+    CreateUser(ctx context.Context, req CreateUserRequest) (*entity.User, error)
+    GetUser(ctx context.Context, id string) (*entity.User, error)
+    UpdateUser(ctx context.Context, id string, req UpdateUserRequest) (*entity.User, error)
+    DeleteUser(ctx context.Context, id string) error
+}
+
+type CreateUserRequest struct {
+    Name     string `json:"name" validate:"required"`
+    Email    string `json:"email" validate:"required,email"`
+    Password string `json:"password" validate:"required,min=8"`
+}
+
+type UpdateUserRequest struct {
+    Name  *string `json:"name,omitempty"`
+    Email *string `json:"email,omitempty"`
+}
+```
+
+#### 失敗するテストを書く（Red）
+```go
+// internal/usecase/user_service_test.go
+package usecase
+
+import (
+    "context"
+    "testing"
+    "webapi-template/internal/domain/entity"
+    "webapi-template/tests/mocks"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/mock"
+    "github.com/oklog/ulid/v2"
+)
+
+func TestUserService_CreateUser_Success(t *testing.T) {
+    // Arrange
+    mockRepo := new(mocks.MockUserRepository)
+    service := NewUserService(mockRepo) // まだ実装されていない
+    
+    ctx := context.Background()
+    req := CreateUserRequest{
+        Name:     "John Doe",
+        Email:    "john@example.com",
+        Password: "password123",
+    }
+    
+    // 重複チェック：ユーザーが存在しない
+    mockRepo.On("FindByEmail", ctx, req.Email).Return(nil, ErrUserNotFound)
+    
+    // ユーザー作成が成功
+    mockRepo.On("Create", ctx, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    // Act
+    user, err := service.CreateUser(ctx, req)
+    
+    // Assert
+    assert.NoError(t, err)
+    assert.NotNil(t, user)
+    assert.Equal(t, req.Name, user.Name)
+    assert.Equal(t, req.Email, user.Email)
+    assert.True(t, isValidULID(user.ID)) // ULIDが生成されている
+    assert.NotEmpty(t, user.Password)    // パスワードがハッシュ化されている
+    
+    mockRepo.AssertExpectations(t)
+}
+
+func TestUserService_CreateUser_DuplicateEmail_ReturnsError(t *testing.T) {
+    // Arrange
+    mockRepo := new(mocks.MockUserRepository)
+    service := NewUserService(mockRepo)
+    
+    ctx := context.Background()
+    req := CreateUserRequest{
+        Name:     "John Doe",
+        Email:    "john@example.com",
+        Password: "password123",
+    }
+    
+    existingUser := &entity.User{
+        ID:    ulid.Make().String(),
+        Email: req.Email,
+    }
+    
+    // 重複チェック：既存ユーザーが存在
+    mockRepo.On("FindByEmail", ctx, req.Email).Return(existingUser, nil)
+    
+    // Act
+    user, err := service.CreateUser(ctx, req)
+    
+    // Assert
+    assert.Error(t, err)
+    assert.Nil(t, user)
+    
+    var appErr *AppError
+    assert.True(t, errors.As(err, &appErr))
+    assert.Equal(t, "EMAIL_ALREADY_EXISTS", appErr.Code)
+    
+    mockRepo.AssertExpectations(t)
+}
+
+// ヘルパー関数
+func isValidULID(id string) bool {
+    if len(id) != 26 {
+        return false
+    }
+    _, err := ulid.Parse(id)
+    return err == nil
+}
+```
+
+### Step 2: 最小限の実装（Green）
+
+#### テストを通すための実装
+```go
+// internal/usecase/user_service_impl.go
+package usecase
+
+import (
+    "context"
+    "fmt"
+    "webapi-template/internal/domain/entity"
+    "webapi-template/internal/domain/repository"
+    "webapi-template/pkg/password"
+    "github.com/oklog/ulid/v2"
+)
+
+type userService struct {
+    userRepo repository.UserRepository
+}
+
+func NewUserService(userRepo repository.UserRepository) UserService {
+    return &userService{
+        userRepo: userRepo,
+    }
+}
+
+func (s *userService) CreateUser(ctx context.Context, req CreateUserRequest) (*entity.User, error) {
+    // 1. バリデーション
+    if err := s.validateCreateUserRequest(req); err != nil {
+        return nil, err
+    }
+    
+    // 2. 重複チェック
+    existingUser, err := s.userRepo.FindByEmail(ctx, req.Email)
+    if err == nil && existingUser != nil {
+        return nil, &AppError{
+            Code:    "EMAIL_ALREADY_EXISTS",
+            Message: "Email already exists",
+        }
+    }
+    
+    // 3. パスワードハッシュ化
+    hashedPassword, err := password.HashPassword(req.Password)
+    if err != nil {
+        return nil, fmt.Errorf("failed to hash password: %w", err)
+    }
+    
+    // 4. ユーザー作成
+    user := &entity.User{
+        ID:       ulid.Make().String(), // ULID生成
+        Name:     req.Name,
+        Email:    req.Email,
+        Password: hashedPassword,
+        Role:     entity.UserRoleUser,
+    }
+    
+    if err := s.userRepo.Create(ctx, user); err != nil {
+        return nil, fmt.Errorf("failed to create user: %w", err)
+    }
+    
+    return user, nil
+}
+
+func (s *userService) GetUser(ctx context.Context, id string) (*entity.User, error) {
+    // ULID検証
+    if !isValidULID(id) {
+        return nil, &AppError{
+            Code:    "INVALID_USER_ID",
+            Message: "Invalid user ID format",
+        }
+    }
+    
+    user, err := s.userRepo.FindByID(ctx, id)
+    if err != nil {
+        return nil, err
+    }
+    
+    return user, nil
+}
+
+func (s *userService) UpdateUser(ctx context.Context, id string, req UpdateUserRequest) (*entity.User, error) {
+    // ULID検証
+    if !isValidULID(id) {
+        return nil, &AppError{
+            Code:    "INVALID_USER_ID",
+            Message: "Invalid user ID format",
+        }
+    }
+    
+    // 既存ユーザー取得
+    user, err := s.userRepo.FindByID(ctx, id)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 更新処理
+    if req.Name != nil {
+        user.Name = *req.Name
+    }
+    if req.Email != nil {
+        // メールアドレス重複チェック
+        if *req.Email != user.Email {
+            existingUser, err := s.userRepo.FindByEmail(ctx, *req.Email)
+            if err == nil && existingUser != nil {
+                return nil, &AppError{
+                    Code:    "EMAIL_ALREADY_EXISTS",
+                    Message: "Email already exists",
+                }
+            }
+        }
+        user.Email = *req.Email
+    }
+    
+    if err := s.userRepo.Update(ctx, user); err != nil {
+        return nil, fmt.Errorf("failed to update user: %w", err)
+    }
+    
+    return user, nil
+}
+
+func (s *userService) DeleteUser(ctx context.Context, id string) error {
+    // ULID検証
+    if !isValidULID(id) {
+        return &AppError{
+            Code:    "INVALID_USER_ID",
+            Message: "Invalid user ID format",
+        }
+    }
+    
+    // 存在確認
+    _, err := s.userRepo.FindByID(ctx, id)
+    if err != nil {
+        return err
+    }
+    
+    return s.userRepo.Delete(ctx, id)
+}
+
+func (s *userService) validateCreateUserRequest(req CreateUserRequest) error {
+    if req.Name == "" {
+        return &AppError{
+            Code:    "VALIDATION_ERROR",
+            Message: "Name is required",
+        }
+    }
+    if req.Email == "" {
+        return &AppError{
+            Code:    "VALIDATION_ERROR",
+            Message: "Email is required",
+        }
+    }
+    if len(req.Password) < 8 {
+        return &AppError{
+            Code:    "VALIDATION_ERROR",
+            Message: "Password must be at least 8 characters",
+        }
+    }
+    return nil
+}
+
+func isValidULID(id string) bool {
+    if len(id) != 26 {
+        return false
+    }
+    _, err := ulid.Parse(id)
+    return err == nil
+}
+```
+
+### Step 3: リファクタリング（Refactor）
+
+#### コードの改善
+```go
+// internal/usecase/user_service_impl.go（改善版）
+package usecase
+
+import (
+    "context"
+    "fmt"
+    "webapi-template/internal/domain/entity"
+    "webapi-template/internal/domain/repository"
+    "webapi-template/pkg/logger"
+    "webapi-template/pkg/password"
+    "webapi-template/pkg/validator"
+    "github.com/oklog/ulid/v2"
+)
+
+type userService struct {
+    userRepo  repository.UserRepository
+    logger    logger.Logger
+    validator validator.Validator
+}
+
+func NewUserService(
+    userRepo repository.UserRepository,
+    logger logger.Logger,
+    validator validator.Validator,
+) UserService {
+    return &userService{
+        userRepo:  userRepo,
+        logger:    logger,
+        validator: validator,
+    }
+}
+
+func (s *userService) CreateUser(ctx context.Context, req CreateUserRequest) (*entity.User, error) {
+    s.logger.Info("Creating user", "email", req.Email)
+    
+    // 1. バリデーション（改善：構造化バリデーション）
+    if err := s.validator.Validate(req); err != nil {
+        s.logger.Error("Validation failed", "error", err, "email", req.Email)
+        return nil, &AppError{
+            Code:    "VALIDATION_ERROR",
+            Message: "Validation failed",
+            Details: err,
+        }
+    }
+    
+    // 2. 重複チェック（改善：ログ追加）
+    if err := s.checkEmailDuplication(ctx, req.Email); err != nil {
+        s.logger.Warn("Email duplication detected", "email", req.Email)
+        return nil, err
+    }
+    
+    // 3. パスワードハッシュ化（改善：エラーハンドリング強化）
+    hashedPassword, err := password.HashPassword(req.Password)
+    if err != nil {
+        s.logger.Error("Failed to hash password", "error", err)
+        return nil, &AppError{
+            Code:    "INTERNAL_ERROR",
+            Message: "Failed to process password",
+        }
+    }
+    
+    // 4. ユーザー作成（改善：構造化）
+    user := s.buildUserFromRequest(req, hashedPassword)
+    
+    if err := s.userRepo.Create(ctx, user); err != nil {
+        s.logger.Error("Failed to create user", "error", err, "email", req.Email)
+        return nil, &AppError{
+            Code:    "INTERNAL_ERROR",
+            Message: "Failed to create user",
+        }
+    }
+    
+    s.logger.Info("User created successfully", "user_id", user.ID, "email", user.Email)
+    return user, nil
+}
+
+// 重複チェックロジックの分離
+func (s *userService) checkEmailDuplication(ctx context.Context, email string) error {
+    existingUser, err := s.userRepo.FindByEmail(ctx, email)
+    if err != nil && !isNotFoundError(err) {
+        return fmt.Errorf("failed to check email duplication: %w", err)
+    }
+    
+    if existingUser != nil {
+        return &AppError{
+            Code:    "EMAIL_ALREADY_EXISTS",
+            Message: "Email already exists",
+        }
+    }
+    
+    return nil
+}
+
+// ユーザー構築ロジックの分離
+func (s *userService) buildUserFromRequest(req CreateUserRequest, hashedPassword string) *entity.User {
+    return &entity.User{
+        ID:       ulid.Make().String(),
+        Name:     req.Name,
+        Email:    req.Email,
+        Password: hashedPassword,
+        Role:     entity.UserRoleUser,
+    }
+}
+
+// エラー判定ヘルパー
+func isNotFoundError(err error) bool {
+    var appErr *AppError
+    return errors.As(err, &appErr) && appErr.Code == "USER_NOT_FOUND"
+}
+```
+
+## TDD でのテストパターン
+
+### Given-When-Then パターン
+```go
+func TestUserService_CreateUser_WithValidData_ShouldReturnUser(t *testing.T) {
+    // Given（前提条件）
+    mockRepo := new(mocks.MockUserRepository)
+    mockLogger := logger.NewNullLogger()
+    mockValidator := validator.NewMockValidator()
+    service := NewUserService(mockRepo, mockLogger, mockValidator)
+    
+    ctx := context.Background()
+    req := CreateUserRequest{
+        Name:     "John Doe",
+        Email:    "john@example.com",
+        Password: "password123",
+    }
+    
+    mockValidator.On("Validate", req).Return(nil)
+    mockRepo.On("FindByEmail", ctx, req.Email).Return(nil, ErrUserNotFound)
+    mockRepo.On("Create", ctx, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    // When（実行）
+    user, err := service.CreateUser(ctx, req)
+    
+    // Then（結果検証）
+    assert.NoError(t, err)
+    assert.NotNil(t, user)
+    assert.Equal(t, req.Name, user.Name)
+    assert.Equal(t, req.Email, user.Email)
+    assert.True(t, isValidULID(user.ID))
+    
+    mockRepo.AssertExpectations(t)
+    mockValidator.AssertExpectations(t)
+}
+```
+
+### テーブルドリブンテスト（TDD適用）
+```go
+func TestUserService_CreateUser_ValidationCases(t *testing.T) {
+    tests := []struct {
+        name        string
+        request     CreateUserRequest
+        wantErr     bool
+        expectedErr string
+    }{
+        {
+            name: "valid request",
+            request: CreateUserRequest{
+                Name:     "John Doe",
+                Email:    "john@example.com",
+                Password: "password123",
+            },
+            wantErr: false,
+        },
+        {
+            name: "empty name",
+            request: CreateUserRequest{
+                Name:     "",
+                Email:    "john@example.com",
+                Password: "password123",
+            },
+            wantErr:     true,
+            expectedErr: "VALIDATION_ERROR",
+        },
+        {
+            name: "invalid email",
+            request: CreateUserRequest{
+                Name:     "John Doe",
+                Email:    "invalid-email",
+                Password: "password123",
+            },
+            wantErr:     true,
+            expectedErr: "VALIDATION_ERROR",
+        },
+        {
+            name: "short password",
+            request: CreateUserRequest{
+                Name:     "John Doe",
+                Email:    "john@example.com",
+                Password: "123",
+            },
+            wantErr:     true,
+            expectedErr: "VALIDATION_ERROR",
+        },
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            // Given
+            mockRepo := new(mocks.MockUserRepository)
+            mockLogger := logger.NewNullLogger()
+            mockValidator := validator.NewMockValidator()
+            service := NewUserService(mockRepo, mockLogger, mockValidator)
+            
+            ctx := context.Background()
+            
+            if tt.wantErr {
+                mockValidator.On("Validate", tt.request).Return(fmt.Errorf("validation error"))
+            } else {
+                mockValidator.On("Validate", tt.request).Return(nil)
+                mockRepo.On("FindByEmail", ctx, tt.request.Email).Return(nil, ErrUserNotFound)
+                mockRepo.On("Create", ctx, mock.AnythingOfType("*entity.User")).Return(nil)
+            }
+            
+            // When
+            user, err := service.CreateUser(ctx, tt.request)
+            
+            // Then
+            if tt.wantErr {
+                assert.Error(t, err)
+                assert.Nil(t, user)
+                if tt.expectedErr != "" {
+                    var appErr *AppError
+                    assert.True(t, errors.As(err, &appErr))
+                    assert.Equal(t, tt.expectedErr, appErr.Code)
+                }
+            } else {
+                assert.NoError(t, err)
+                assert.NotNil(t, user)
+                assert.True(t, isValidULID(user.ID))
+            }
+            
+            mockRepo.AssertExpectations(t)
+            mockValidator.AssertExpectations(t)
+        })
+    }
+}
+```
+
+## TDD のベストプラクティス
+
+### 1. 小さなステップで進める
+```go
+// Step 1: 最も単純なケースから始める
+func TestUserService_CreateUser_MinimalCase(t *testing.T) {
+    // 最小限の成功ケース
+}
+
+// Step 2: エラーケースを追加
+func TestUserService_CreateUser_ValidationError(t *testing.T) {
+    // バリデーションエラーケース
+}
+
+// Step 3: 境界値テストを追加
+func TestUserService_CreateUser_EdgeCases(t *testing.T) {
+    // 境界値テスト
+}
+```
+
+### 2. テストの独立性を保つ
+```go
+func TestUserService_CreateUser_IndependentTest(t *testing.T) {
+    // 各テストで新しいモックを作成
+    mockRepo := new(mocks.MockUserRepository)
+    service := NewUserService(mockRepo)
+    
+    // テスト固有の設定
+    // ...
+    
+    // テスト後のクリーンアップは不要（モック使用）
+}
+```
+
+### 3. 意味のあるテスト名
+```go
+// ❌ Bad
+func TestCreateUser(t *testing.T) {}
+
+// ✅ Good
+func TestUserService_CreateUser_WithValidData_ShouldReturnUser(t *testing.T) {}
+func TestUserService_CreateUser_WithDuplicateEmail_ShouldReturnError(t *testing.T) {}
+func TestUserService_CreateUser_WithInvalidEmail_ShouldReturnValidationError(t *testing.T) {}
+```
+
+## TDD ワークフロー
+
+### 1. 機能開発の手順
+```
+1. 要件を理解する
+2. 受け入れテスト（E2E）を書く
+3. 単体テストを書く（Red）
+4. 最小限の実装（Green）
+5. リファクタリング
+6. 統合テストで検証
+7. 次の機能へ
+```
+
+### 2. デバッグ時の手順
+```
+1. 失敗するテストを特定
+2. より小さな単位でテストを書く
+3. 原因を特定
+4. テストを通す修正
+5. 既存テストが壊れていないか確認
+```
+
+### 3. リファクタリング時の手順
+```
+1. 既存テストがすべて通ることを確認
+2. リファクタリング実施
+3. テストを再実行
+4. 必要に応じてテストも改善
+```
+
+## TDD ベストプラクティス
+
+### DO's (推奨事項)
+
+1. **小さなステップで進む**
+   - 一度に一つのテストケースを追加
+   - 最小限のコードで通す
+
+2. **意味のあるテスト名**
+   ```go
+   // Good
+   func TestUserService_CreateUser_DuplicateEmail_ReturnsError(t *testing.T)
+   
+   // Bad
+   func TestCreateUser(t *testing.T)
+   ```
+
+3. **Given-When-Then パターン**
+   ```go
+   func TestExample(t *testing.T) {
+       // Given (Arrange)
+       setup()
+       
+       // When (Act)
+       result := action()
+       
+       // Then (Assert)
+       assert.Equal(t, expected, result)
+   }
+   ```
+
+4. **テストの独立性**
+   ```go
+   func TestUserService_CreateUser(t *testing.T) {
+       // 毎回新しいサービスインスタンスを作成
+       service := NewUserService(newMockRepo())
+       
+       // テストが他のテストに依存しない
+   }
+   ```
+
+### DON'Ts (避けるべき事項)
+
+1. **テストのためのコード**
+   ```go
+   // Bad: テストのためだけのpublicメソッド
+   func (s *userService) GetRepo() UserRepository {
+       return s.repo // テストでアクセスするためだけ
+   }
+   ```
+
+2. **複雑すぎるテスト**
+   ```go
+   // Bad: 一つのテストで複数のことをテスト
+   func TestUserServiceComplexFlow(t *testing.T) {
+       // ユーザー作成、更新、削除を一つのテストで実行
+   }
+   ```
+
+3. **実装に依存したテスト**
+   ```go
+   // Bad: 内部実装に依存
+   func TestUserService_CreateUser_CallsRepositoryCreate(t *testing.T) {
+       // リポジトリのCreateが呼ばれることをテスト（WHATではなくHOWをテスト）
+   }
+   ```
+
+## TDD ツールとライブラリ
+
+### 推奨ライブラリ
+```go
+import (
+    "testing"
+    "github.com/stretchr/testify/assert"    // アサーション
+    "github.com/stretchr/testify/mock"      // モック
+    "github.com/stretchr/testify/suite"     // テストスイート
+    "github.com/DATA-DOG/go-sqlmock"        // SQLモック
+)
+```
+
+### テスト実行コマンド
+```bash
+# TDD用のテスト監視
+go test -v ./... -watch
+
+# カバレッジ確認
+go test -cover ./...
+
+# ベンチマーク付きテスト
+go test -bench=. ./...
+```
+
+## IDE/エディタ設定
+
+### VS Code 設定例
+```json
+{
+    "go.testFlags": ["-v"],
+    "go.testTimeout": "10s",
+    "go.coverOnSave": true,
+    "go.coverOnSaveMode": "package"
+}
+```
+
+### 自動テスト実行
+```bash
+# ファイル変更時の自動テスト実行
+find . -name "*.go" | entr -r go test ./...
+```
+

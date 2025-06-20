@@ -1,0 +1,1207 @@
+---
+description: "Go言語の基本コーディング規約"
+globs: "**/*.go"
+alwaysApply: true
+---
+# Golang コーディング規則
+
+## 基本原則
+
+### コードスタイル
+- `gofmt` と `goimports` を必ず使用する
+- `golangci-lint` によるリンターチェックを通すこと
+- Go の標準的な命名規則に従う
+
+### 命名規則
+
+#### パッケージ名
+- 小文字のみ使用
+- 単語間のアンダースコアや大文字は使用しない
+- 短く意味のある名前をつける
+```go
+// Good
+package user
+package database
+
+// Bad
+package userService
+package data_base
+```
+
+#### 変数・関数名
+- キャメルケースを使用
+- 公開関数・変数は大文字で開始
+- 非公開関数・変数は小文字で開始
+```go
+// Good
+func GetUserByID(id string) (*User, error)
+func validateInput(input string) bool
+var maxRetryCount = 3
+
+// Bad
+func get_user_by_id(id string) (*User, error)
+func ValidateInput(input string) bool  // 非公開なのに大文字開始
+```
+
+#### 構造体
+- パスカルケースを使用
+- 公開構造体は大文字で開始
+```go
+// Good
+type User struct {
+    ID    string `json:"id"`
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+type userRepository struct {
+    db *gorm.DB
+}
+```
+
+#### 定数
+- すべて大文字、アンダースコアで区切る
+```go
+// Good
+const (
+    DEFAULT_PORT = 8080
+    MAX_RETRY_COUNT = 3
+    API_VERSION = "v1"
+)
+```
+
+### ファイル・ディレクトリ構造
+
+#### ファイル名
+- 小文字とアンダースコアを使用
+- テストファイルは `_test.go` で終わる
+```
+user.go
+user_service.go
+user_repository.go
+user_test.go
+```
+
+#### ディレクトリ構造
+```
+project/
+├── cmd/
+│   └── server/
+│       └── main.go              # エントリーポイント
+├── internal/                    # プライベートコード
+│   ├── domain/
+│   │   ├── entity/              # エンティティ
+│   │   │   ├── user.go
+│   │   │   └── post.go
+│   │   └── repository/          # リポジトリインターフェース
+│   │       ├── user_repository.go
+│   │       └── post_repository.go
+│   ├── usecase/                 # ビジネスロジック
+│   │   ├── user_service.go
+│   │   └── post_service.go
+│   ├── handler/                 # HTTPハンドラー
+│   │   ├── user_handler.go
+│   │   └── post_handler.go
+│   └── infrastructure/          # 外部依存
+│       ├── database/
+│       │   ├── cockroachdb.go
+│       │   └── user_repository_impl.go
+│       ├── cache/
+│       │   └── redis.go
+│       └── config/
+│           └── config.go
+├── pkg/                         # 再利用可能なコード
+│   ├── logger/
+│   ├── validator/
+│   ├── ulid/
+│   └── middleware/
+└── tests/                       # テスト
+    ├── integration/
+    └── e2e/
+```
+
+## エラーハンドリング
+
+### エラーの定義
+```go
+// カスタムエラータイプを定義
+type AppError struct {
+    Code    string `json:"code"`
+    Message string `json:"message"`
+    Err     error  `json:"-"`
+}
+
+func (e *AppError) Error() string {
+    if e.Err != nil {
+        return fmt.Sprintf("%s: %v", e.Message, e.Err)
+    }
+    return e.Message
+}
+
+// エラー定数を定義
+var (
+    ErrUserNotFound = &AppError{
+        Code:    "USER_NOT_FOUND",
+        Message: "ユーザーが見つかりません",
+    }
+    ErrInvalidInput = &AppError{
+        Code:    "INVALID_INPUT",
+        Message: "入力値が不正です",
+    }
+)
+```
+
+### エラーの処理
+```go
+// エラーラッピング
+func (s *userService) GetUser(id string) (*User, error) {
+    user, err := s.repo.FindByID(id)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get user: %w", err)
+    }
+    return user, nil
+}
+
+// エラーハンドリング
+func (h *userHandler) GetUser(c *gin.Context) {
+    id := c.Param("id")
+    if !isValidULID(id) {
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "Invalid user ID format",
+        })
+        return
+    }
+
+    user, err := h.service.GetUser(id)
+    if err != nil {
+        if errors.Is(err, ErrUserNotFound) {
+            c.JSON(http.StatusNotFound, gin.H{
+                "error": err.Error(),
+            })
+            return
+        }
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Internal server error",
+        })
+        return
+    }
+
+    c.JSON(http.StatusOK, user)
+}
+```
+
+## データベース関連
+
+### GORM使用規則（CockroachDB対応）
+```go
+// モデル定義（ULID対応）
+type User struct {
+    ID        string         `gorm:"type:varchar(26);primaryKey" json:"id"`
+    Name      string         `gorm:"not null" json:"name"`
+    Email     string         `gorm:"uniqueIndex;not null" json:"email"`
+    CreatedAt time.Time      `json:"created_at"`
+    UpdatedAt time.Time      `json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+}
+
+// ULID自動生成
+func (u *User) BeforeCreate(tx *gorm.DB) error {
+    if u.ID == "" {
+        u.ID = ulid.Make().String()
+    }
+    return nil
+}
+
+// テーブル名の明示的指定
+func (User) TableName() string {
+    return "users"
+}
+
+// リポジトリ実装
+type userRepository struct {
+    db *gorm.DB
+}
+
+func (r *userRepository) Create(user *User) error {
+    return r.db.Create(user).Error
+}
+
+func (r *userRepository) FindByID(id string) (*User, error) {
+    var user User
+    err := r.db.First(&user, "id = ?", id).Error
+    if err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            return nil, ErrUserNotFound
+        }
+        return nil, err
+    }
+    return &user, nil
+}
+```
+
+### マイグレーション
+```go
+// migrations/001_create_users.go
+func CreateUsersTable(db *gorm.DB) error {
+    return db.AutoMigrate(&User{})
+}
+```
+
+## JSON レスポンス
+
+### 標準レスポンス形式
+```go
+// 成功レスポンス
+type SuccessResponse struct {
+    Data    interface{} `json:"data"`
+    Message string      `json:"message,omitempty"`
+}
+
+// エラーレスポンス
+type ErrorResponse struct {
+    Error   string `json:"error"`
+    Code    string `json:"code,omitempty"`
+    Details string `json:"details,omitempty"`
+}
+
+// ページングレスポンス
+type PaginatedResponse struct {
+    Data       interface{} `json:"data"`
+    Page       int         `json:"page"`
+    PageSize   int         `json:"page_size"`
+    TotalCount int64       `json:"total_count"`
+    TotalPages int         `json:"total_pages"`
+}
+```
+
+## テスト
+
+### テストファイルの命名
+- `*_test.go` で終わる
+- テスト対象ファイルと同じディレクトリに配置
+
+### テスト関数の命名
+```go
+func TestFunctionName_Condition_ExpectedResult(t *testing.T) {
+    // テストコード
+}
+
+// 例
+func TestUserService_GetUser_UserExists_ReturnsUser(t *testing.T) {}
+func TestUserService_GetUser_UserNotFound_ReturnsError(t *testing.T) {}
+```
+
+### テーブルドリブンテスト
+```go
+func TestUserValidation(t *testing.T) {
+    tests := []struct {
+        name    string
+        user    User
+        wantErr bool
+    }{
+        {
+            name: "valid user",
+            user: User{Name: "John", Email: "john@example.com"},
+            wantErr: false,
+        },
+        {
+            name: "empty name",
+            user: User{Name: "", Email: "john@example.com"},
+            wantErr: true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            err := ValidateUser(tt.user)
+            if (err != nil) != tt.wantErr {
+                t.Errorf("ValidateUser() error = %v, wantErr %v", err, tt.wantErr)
+            }
+        })
+    }
+}
+```
+
+## ログ
+
+### ログレベル
+- DEBUG: デバッグ情報
+- INFO: 一般的な情報
+- WARN: 警告
+- ERROR: エラー
+- FATAL: 致命的エラー
+
+### ログ形式
+```go
+// 構造化ログ
+logger.Info("User created successfully",
+    "user_id", user.ID,
+    "email", user.Email,
+    "timestamp", time.Now(),
+)
+
+logger.Error("Failed to create user",
+    "error", err.Error(),
+    "input", input,
+    "timestamp", time.Now(),
+)
+```
+
+## パフォーマンス
+
+### データベースクエリ
+- N+1 問題を避けるためPreloadを適切に使用
+- インデックスを適切に設定
+- 不要なフィールドの取得を避ける
+
+```go
+// Good: Preloadを使用
+var users []User
+db.Preload("Posts").Find(&users)
+
+// Bad: N+1 問題
+var users []User
+db.Find(&users)
+for _, user := range users {
+    db.Where("user_id = ?", user.ID).Find(&user.Posts)
+}
+```
+
+### メモリ使用量
+- 大きなスライスの事前割り当て
+- 不要なメモリリークを避ける
+
+```go
+// Good: 容量を事前に指定
+users := make([]User, 0, expectedCount)
+
+// Good: contextを適切に使用
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+```
+
+## セキュリティ
+
+### 入力検証
+```go
+// バリデーションタグを使用
+type CreateUserRequest struct {
+    Name  string `json:"name" binding:"required,min=1,max=100"`
+    Email string `json:"email" binding:"required,email"`
+}
+
+// カスタムバリデーション
+func validateUser(user *User) error {
+    if user.Name == "" {
+        return ErrInvalidInput
+    }
+    if !isValidEmail(user.Email) {
+        return ErrInvalidInput
+    }
+    return nil
+}
+```
+
+### SQL インジェクション対策
+```go
+// Good: パラメータ化クエリ
+db.Where("name = ? AND email = ?", name, email).Find(&users)
+
+// Bad: 文字列結合
+db.Where(fmt.Sprintf("name = '%s'", name)).Find(&users)
+```
+
+## ULID サポート
+
+### ULID ユーティリティ
+```go
+// pkg/ulid/ulid.go
+package ulid
+
+import (
+    "crypto/rand"
+    "time"
+    "github.com/oklog/ulid/v2"
+)
+
+// ULID生成
+func New() string {
+    return ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
+}
+
+// ULID検証
+func IsValid(id string) bool {
+    _, err := ulid.Parse(id)
+    return err == nil
+}
+
+// ULID時刻抽出
+func ExtractTime(id string) (time.Time, error) {
+    parsed, err := ulid.Parse(id)
+    if err != nil {
+        return time.Time{}, err
+    }
+    return ulid.Time(parsed.Time()), nil
+}
+```
+
+## Go 1.24 特有の機能とベストプラクティス
+
+### go.mod ファイル設定
+```go
+// go.mod
+module webapi-template
+
+go 1.24
+
+require (
+    github.com/gin-gonic/gin v1.9.1
+    gorm.io/gorm v1.25.5
+    gorm.io/driver/postgres v1.5.4
+    github.com/go-redis/redis/v8 v8.11.5
+    github.com/stretchr/testify v1.8.4
+    github.com/golang-jwt/jwt/v4 v4.5.0
+    github.com/oklog/ulid/v2 v2.1.0
+)
+```
+
+### range over integers（Go 1.22+）
+```go
+// Good: Go 1.22以降の range over integers
+for i := range 10 {
+    fmt.Println(i) // 0から9まで
+}
+
+// Good: より読みやすいループ
+for i := range len(users) {
+    processUser(users[i])
+}
+```
+
+### 新しいパッケージとライブラリ活用
+
+#### slog パッケージの使用（Go 1.21+）
+```go
+package logger
+
+import (
+    "log/slog"
+    "os"
+)
+
+func NewLogger() *slog.Logger {
+    return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+        Level: slog.LevelInfo,
+    }))
+}
+
+// 構造化ログの使用例
+func (s *userService) CreateUser(ctx context.Context, req CreateUserRequest) (*entity.User, error) {
+    slog.Info("Creating user", 
+        "email", req.Email,
+        "request_id", getRequestID(ctx),
+    )
+    
+    user, err := s.repo.Create(ctx, &entity.User{
+        Name:  req.Name,
+        Email: req.Email,
+    })
+    
+    if err != nil {
+        slog.Error("Failed to create user",
+            "error", err,
+            "email", req.Email,
+        )
+        return nil, err
+    }
+    
+    slog.Info("User created successfully",
+        "user_id", user.ID,
+        "email", user.Email,
+    )
+    
+    return user, nil
+}
+```
+
+### Go Workspaces の活用
+```go
+// go.work (マルチモジュールプロジェクト用)
+go 1.24
+
+use (
+    .
+    ./tools
+    ./client
+)
+```
+
+## Go 言語アンチパターン対策
+
+### Interface Pollution（インターフェース汚染）の回避
+
+#### ❌ Bad: 過度なインターフェース抽象化
+```go
+// Bad: 必要のないインターフェース
+type UserGetter interface {
+    GetUser(id string) (*User, error)
+}
+
+type UserCreator interface {
+    CreateUser(user *User) error
+}
+
+type UserUpdater interface {
+    UpdateUser(user *User) error
+}
+
+type UserDeleter interface {
+    DeleteUser(id string) error
+}
+
+// 過度に細分化されたインターフェース
+type UserService interface {
+    UserGetter
+    UserCreator
+    UserUpdater
+    UserDeleter
+}
+```
+
+#### ✅ Good: 適切なインターフェース設計
+```go
+// Good: 実際の使用パターンに基づいたインターフェース
+type UserRepository interface {
+    FindByID(ctx context.Context, id string) (*entity.User, error)
+    FindByEmail(ctx context.Context, email string) (*entity.User, error)
+    Create(ctx context.Context, user *entity.User) error
+    Update(ctx context.Context, user *entity.User) error
+    Delete(ctx context.Context, id string) error
+}
+
+// 小さな、目的が明確なインターフェース
+type UserValidator interface {
+    Validate(user *entity.User) error
+}
+```
+
+### Goroutine リークの防止
+
+#### ❌ Bad: Goroutineが終了しない
+```go
+// Bad: 無限に動作するgoroutine
+func (s *service) StartBackgroundTask() {
+    go func() {
+        for {
+            // 無限ループ - 停止方法がない
+            doWork()
+            time.Sleep(time.Second)
+        }
+    }()
+}
+```
+
+#### ✅ Good: 適切なGoroutine管理
+```go
+// Good: contextによる制御
+func (s *service) StartBackgroundTask(ctx context.Context) {
+    go func() {
+        ticker := time.NewTicker(time.Second)
+        defer ticker.Stop()
+        
+        for {
+            select {
+            case <-ctx.Done():
+                return // contextがキャンセルされたら終了
+            case <-ticker.C:
+                doWork()
+            }
+        }
+    }()
+}
+
+// Good: チャネルによる制御
+func (s *service) StartWorker(stopCh <-chan struct{}) {
+    go func() {
+        for {
+            select {
+            case <-stopCh:
+                return
+            default:
+                doWork()
+            }
+        }
+    }()
+}
+```
+
+### Context 誤用の回避
+
+#### ❌ Bad: Context の不適切な使用
+```go
+// Bad: structにcontextを保存
+type Service struct {
+    ctx context.Context // これは避ける
+    db  *gorm.DB
+}
+
+// Bad: nilcontextの使用
+func (s *Service) GetUser(id string) (*User, error) {
+    return s.repo.FindByID(nil, id) // nilは避ける
+}
+```
+
+#### ✅ Good: Context の適切な使用
+```go
+// Good: 関数の引数として渡す
+func (s *Service) GetUser(ctx context.Context, id string) (*User, error) {
+    return s.repo.FindByID(ctx, id)
+}
+
+// Good: timeoutの設定
+func (s *Service) GetUserWithTimeout(ctx context.Context, id string) (*User, error) {
+    ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+    
+    return s.repo.FindByID(ctx, id)
+}
+```
+
+### Error Suppression（エラー抑制）の回避
+
+#### ❌ Bad: エラーを無視
+```go
+// Bad: エラーを無視
+result, _ := doSomething()
+
+// Bad: 空のエラーハンドリング
+if err != nil {
+    // 何もしない
+}
+```
+
+#### ✅ Good: 適切なエラーハンドリング
+```go
+// Good: エラーを適切に処理
+result, err := doSomething()
+if err != nil {
+    return fmt.Errorf("failed to do something: %w", err)
+}
+
+// Good: ログ出力して継続
+result, err := doSomething()
+if err != nil {
+    slog.Warn("non-critical operation failed", "error", err)
+    // デフォルト値で継続
+    result = getDefaultValue()
+}
+```
+
+### Premature Abstraction（早すぎる抽象化）の回避
+
+#### ❌ Bad: 不要な抽象化
+```go
+// Bad: 1つの実装しかないのにインターフェースを作成
+type EmailSender interface {
+    Send(to, subject, body string) error
+}
+
+type SMTPSender struct {
+    host string
+    port int
+}
+
+func (s *SMTPSender) Send(to, subject, body string) error {
+    // 実装
+}
+
+// 他に実装がないのにインターフェースを使用
+func NewUserService(emailSender EmailSender) *UserService {
+    return &UserService{emailSender: emailSender}
+}
+```
+
+#### ✅ Good: 必要になったら抽象化
+```go
+// Good: 具体的な実装から始める
+type UserService struct {
+    emailSender *SMTPSender
+}
+
+// 複数の実装が必要になったらインターフェースを導入
+type EmailSender interface {
+    Send(to, subject, body string) error
+}
+
+type SMTPSender struct{}
+type SESender struct{}
+```
+
+### Pointer to Interface の回避
+
+#### ❌ Bad: インターフェースへのポインタ
+```go
+// Bad: インターフェースのポインタは避ける
+func ProcessUser(repo *UserRepository) error {
+    // UserRepositoryはインターフェースなのでポインタは不要
+}
+```
+
+#### ✅ Good: インターフェースは値で渡す
+```go
+// Good: インターフェースは値で渡す
+func ProcessUser(repo UserRepository) error {
+    // インターフェースは既に参照型
+}
+```
+
+## 分散トレーシング（OpenTelemetry）
+
+### OpenTelemetry セットアップ
+
+#### 基本設定
+```go
+// pkg/telemetry/telemetry.go
+package telemetry
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "time"
+
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/exporters/jaeger"
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+    "go.opentelemetry.io/otel/propagation"
+    "go.opentelemetry.io/otel/sdk/resource"
+    "go.opentelemetry.io/otel/sdk/trace"
+    semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+)
+
+type Config struct {
+    ServiceName    string
+    ServiceVersion string
+    Environment    string
+    JaegerEndpoint string
+    OTLPEndpoint   string
+    SampleRate     float64
+}
+
+func InitTracer(config Config) func() {
+    // リソース作成
+    res, err := resource.New(context.Background(),
+        resource.WithAttributes(
+            semconv.ServiceNameKey.String(config.ServiceName),
+            semconv.ServiceVersionKey.String(config.ServiceVersion),
+            semconv.DeploymentEnvironmentKey.String(config.Environment),
+        ),
+    )
+    if err != nil {
+        log.Fatalf("Failed to create resource: %v", err)
+    }
+
+    // エクスポーター設定
+    var exporter trace.SpanExporter
+    if config.OTLPEndpoint != "" {
+        exporter, err = otlptracegrpc.New(context.Background(),
+            otlptracegrpc.WithEndpoint(config.OTLPEndpoint),
+            otlptracegrpc.WithInsecure(), // プロダクションでは適切な証明書設定
+        )
+    } else {
+        exporter, err = jaeger.New(jaeger.WithCollectorEndpoint(
+            jaeger.WithEndpoint(config.JaegerEndpoint),
+        ))
+    }
+    
+    if err != nil {
+        log.Fatalf("Failed to create exporter: %v", err)
+    }
+
+    // サンプリング設定
+    sampler := trace.AlwaysSample()
+    if config.SampleRate > 0 && config.SampleRate < 1 {
+        sampler = trace.TraceIDRatioBased(config.SampleRate)
+    }
+
+    // トレーサープロバイダー設定
+    tp := trace.NewTracerProvider(
+        trace.WithBatcher(exporter,
+            trace.WithBatchTimeout(time.Second*5),
+            trace.WithMaxExportBatchSize(512),
+        ),
+        trace.WithResource(res),
+        trace.WithSampler(sampler),
+    )
+
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+        propagation.TraceContext{},
+        propagation.Baggage{},
+    ))
+
+    return func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
+        if err := tp.Shutdown(ctx); err != nil {
+            log.Printf("Error shutting down tracer provider: %v", err)
+        }
+    }
+}
+```
+
+### アプリケーション統合
+```go
+// cmd/server/main.go
+package main
+
+import (
+    "webapi-template/pkg/telemetry"
+)
+
+func main() {
+    // トレーシング初期化
+    shutdown := telemetry.InitTracer(telemetry.Config{
+        ServiceName:    "webapi-template",
+        ServiceVersion: "1.0.0",
+        Environment:    os.Getenv("ENVIRONMENT"),
+        OTLPEndpoint:   os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        SampleRate:     0.1, // 10%サンプリング
+    })
+    defer shutdown()
+
+    // アプリケーション起動
+    app := setupApplication()
+    app.Run()
+}
+```
+
+### ミドルウェア実装
+```go
+// pkg/middleware/tracing.go
+package middleware
+
+import (
+    "github.com/gin-gonic/gin"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/propagation"
+    semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+)
+
+func TracingMiddleware() gin.HandlerFunc {
+    tracer := otel.Tracer("webapi-template")
+    
+    return gin.HandlerFunc(func(c *gin.Context) {
+        // コンテキスト抽出
+        ctx := otel.GetTextMapPropagator().Extract(c.Request.Context(), 
+            propagation.HeaderCarrier(c.Request.Header))
+        
+        // スパン開始
+        spanName := fmt.Sprintf("%s %s", c.Request.Method, c.FullPath())
+        ctx, span := tracer.Start(ctx, spanName)
+        defer span.End()
+
+        // 属性設定
+        span.SetAttributes(
+            semconv.HTTPMethodKey.String(c.Request.Method),
+            semconv.HTTPURLKey.String(c.Request.URL.String()),
+            semconv.HTTPUserAgentKey.String(c.Request.UserAgent()),
+            semconv.HTTPClientIPKey.String(c.ClientIP()),
+        )
+
+        // コンテキスト更新
+        c.Request = c.Request.WithContext(ctx)
+        
+        // 処理実行
+        c.Next()
+
+        // レスポンス属性追加
+        span.SetAttributes(
+            semconv.HTTPStatusCodeKey.Int(c.Writer.Status()),
+            semconv.HTTPResponseSizeKey.Int(c.Writer.Size()),
+        )
+
+        // エラー記録
+        if c.Writer.Status() >= 400 {
+            span.RecordError(fmt.Errorf("HTTP %d", c.Writer.Status()))
+        }
+    })
+}
+```
+
+### サービス層でのトレーシング
+```go
+// internal/usecase/user_service.go
+package usecase
+
+import (
+    "context"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/trace"
+)
+
+type userService struct {
+    userRepo     repository.UserRepository
+    emailService EmailService
+    tracer       trace.Tracer
+}
+
+func NewUserService(userRepo repository.UserRepository, emailService EmailService) UserService {
+    return &userService{
+        userRepo:     userRepo,
+        emailService: emailService,
+        tracer:       otel.Tracer("user-service"),
+    }
+}
+
+func (s *userService) CreateUser(ctx context.Context, req CreateUserRequest) (*entity.User, error) {
+    ctx, span := s.tracer.Start(ctx, "UserService.CreateUser")
+    defer span.End()
+
+    // スパン属性追加
+    span.SetAttributes(
+        attribute.String("user.email", req.Email),
+        attribute.String("user.name", req.Name),
+    )
+
+    // バリデーション
+    if err := s.validateCreateUserRequest(req); err != nil {
+        span.RecordError(err)
+        return nil, err
+    }
+
+    // 重複チェック（子スパン）
+    ctx, checkSpan := s.tracer.Start(ctx, "check_duplicate_email")
+    existingUser, err := s.userRepo.FindByEmail(ctx, req.Email)
+    checkSpan.End()
+    
+    if err == nil && existingUser != nil {
+        err := &AppError{Code: "EMAIL_ALREADY_EXISTS", Message: "Email already exists"}
+        span.RecordError(err)
+        return nil, err
+    }
+
+    // ユーザー作成（子スパン）
+    user := &entity.User{
+        Name:  req.Name,
+        Email: req.Email,
+    }
+
+    ctx, createSpan := s.tracer.Start(ctx, "create_user_in_db")
+    err = s.userRepo.Create(ctx, user)
+    createSpan.End()
+    
+    if err != nil {
+        span.RecordError(err)
+        return nil, fmt.Errorf("failed to create user: %w", err)
+    }
+
+    // メール送信（非同期、別スパン）
+    go func() {
+        emailCtx, emailSpan := s.tracer.Start(context.Background(), "send_welcome_email")
+        defer emailSpan.End()
+        
+        emailSpan.SetAttributes(
+            attribute.String("email.to", user.Email),
+            attribute.String("email.type", "welcome"),
+        )
+        
+        if err := s.emailService.SendWelcomeEmail(emailCtx, user.Email, user.Name); err != nil {
+            emailSpan.RecordError(err)
+        }
+    }()
+
+    span.SetAttributes(
+        attribute.String("user.id", user.ID),
+        attribute.String("operation.result", "success"),
+    )
+
+    return user, nil
+}
+```
+
+### リポジトリ層でのトレーシング
+```go
+// internal/infrastructure/database/user_repository.go
+package database
+
+import (
+    "context"
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/trace"
+    "gorm.io/gorm"
+)
+
+type userRepository struct {
+    db     *gorm.DB
+    tracer trace.Tracer
+}
+
+func NewUserRepository(db *gorm.DB) repository.UserRepository {
+    return &userRepository{
+        db:     db,
+        tracer: otel.Tracer("user-repository"),
+    }
+}
+
+func (r *userRepository) Create(ctx context.Context, user *User) error {
+    ctx, span := r.tracer.Start(ctx, "UserRepository.Create")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.String("db.operation", "INSERT"),
+        attribute.String("db.table", "users"),
+        attribute.String("user.email", user.Email),
+    )
+
+    err := r.db.WithContext(ctx).Create(user).Error
+    if err != nil {
+        span.RecordError(err)
+        span.SetAttributes(attribute.String("error.type", "db_error"))
+        return err
+    }
+
+    span.SetAttributes(
+        attribute.String("user.id", user.ID),
+        attribute.String("operation.result", "success"),
+    )
+
+    return nil
+}
+
+func (r *userRepository) FindByEmail(ctx context.Context, email string) (*User, error) {
+    ctx, span := r.tracer.Start(ctx, "UserRepository.FindByEmail")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.String("db.operation", "SELECT"),
+        attribute.String("db.table", "users"),
+        attribute.String("query.email", email),
+    )
+
+    var user User
+    err := r.db.WithContext(ctx).Where("email = ?", email).First(&user).Error
+    
+    if err != nil {
+        if errors.Is(err, gorm.ErrRecordNotFound) {
+            span.SetAttributes(attribute.String("operation.result", "not_found"))
+            return nil, &AppError{Code: "USER_NOT_FOUND", Message: "User not found"}
+        }
+        span.RecordError(err)
+        return nil, err
+    }
+
+    span.SetAttributes(
+        attribute.String("user.id", user.ID),
+        attribute.String("operation.result", "success"),
+    )
+
+    return &user, nil
+}
+```
+
+### 分散トレーシングのベストプラクティス
+
+#### ✅ Good: 適切なスパン設計
+```go
+// Good: 意味のあるスパン分割
+func (s *userService) ProcessUserRegistration(ctx context.Context, req RegistrationRequest) error {
+    ctx, span := s.tracer.Start(ctx, "ProcessUserRegistration")
+    defer span.End()
+
+    // 1. バリデーション（短い処理はスパン分割不要）
+    if err := s.validateRegistration(req); err != nil {
+        span.RecordError(err)
+        return err
+    }
+
+    // 2. ユーザー作成（意味のある処理単位）
+    ctx, createSpan := s.tracer.Start(ctx, "create_user")
+    user, err := s.createUser(ctx, req.UserData)
+    createSpan.SetAttributes(
+        attribute.String("user.email", req.UserData.Email),
+    )
+    createSpan.End()
+    
+    if err != nil {
+        span.RecordError(err)
+        return err
+    }
+
+    // 3. プロフィール作成（別の処理単位）
+    ctx, profileSpan := s.tracer.Start(ctx, "create_profile")
+    err = s.createProfile(ctx, user.ID, req.ProfileData)
+    profileSpan.End()
+    
+    if err != nil {
+        span.RecordError(err)
+        return err
+    }
+
+    // 4. 非同期処理（リンクで関連付け）
+    go s.sendWelcomeNotifications(trace.ContextWithSpanContext(
+        context.Background(), 
+        span.SpanContext(),
+    ), user)
+
+    return nil
+}
+```
+
+#### ❌ Bad: 過度なスパン分割
+```go
+// Bad: 細かすぎるスパン分割
+func (s *userService) CreateUser(ctx context.Context, req CreateUserRequest) (*entity.User, error) {
+    // 不要：バリデーションごとにスパン作成
+    ctx, nameSpan := s.tracer.Start(ctx, "validate_name")
+    if req.Name == "" {
+        nameSpan.RecordError(errors.New("name required"))
+        nameSpan.End()
+        return nil, errors.New("name required")
+    }
+    nameSpan.End()
+
+    ctx, emailSpan := s.tracer.Start(ctx, "validate_email")
+    if req.Email == "" {
+        emailSpan.RecordError(errors.New("email required"))
+        emailSpan.End()
+        return nil, errors.New("email required")
+    }
+    emailSpan.End()
+
+    // 過度に細分化されている
+}
+```
+
+### エラートレーシング
+```go
+// 構造化エラー情報
+func (s *userService) processPayment(ctx context.Context, amount float64) error {
+    ctx, span := s.tracer.Start(ctx, "process_payment")
+    defer span.End()
+
+    span.SetAttributes(
+        attribute.Float64("payment.amount", amount),
+        attribute.String("payment.currency", "USD"),
+    )
+
+    err := s.paymentGateway.Charge(ctx, amount)
+    if err != nil {
+        // 詳細なエラー情報を記録
+        span.RecordError(err)
+        span.SetAttributes(
+            attribute.String("error.type", "payment_failed"),
+            attribute.String("error.code", getErrorCode(err)),
+            attribute.Bool("error.retryable", isRetryable(err)),
+        )
+        return err
+    }
+
+    span.SetAttributes(attribute.String("operation.result", "success"))
+    return nil
+}
+```

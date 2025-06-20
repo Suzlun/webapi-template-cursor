@@ -1,0 +1,991 @@
+---
+description: "テスト設計と実装の規則（Unit/Integration/E2Eテスト）"
+globs: "**/*_test.go,**/tests/**/*.go,**/test/**/*.go"
+alwaysApply: false
+---
+
+# テスト設計規則
+
+## テスト戦略
+
+### テストピラミッド
+```
+        /\
+       /  \
+      / E2E \     ← End-to-End テスト（少数）
+     /______\
+    /        \
+   /Integration\ ← 統合テスト（中程度）
+  /__________\
+ /            \
+/   Unit Test  \  ← 単体テスト（多数）
+/_______________\
+```
+
+### テストの分類
+- **Unit Test**: 単一の関数・メソッドのテスト
+- **Integration Test**: 複数のコンポーネント間のテスト
+- **E2E Test**: アプリケーション全体のテスト
+
+## 単体テスト（Unit Test）
+
+### テストファイル構造
+```
+internal/
+├── usecase/
+│   ├── user_service.go
+│   └── user_service_test.go      # サービステスト
+├── handler/
+│   ├── user_handler.go
+│   └── user_handler_test.go      # ハンドラーテスト
+└── infrastructure/
+    ├── database/
+    │   ├── user_repository_impl.go
+    │   └── user_repository_impl_test.go  # リポジトリテスト
+```
+
+### テスト命名規則
+```go
+// 関数名_条件_期待する結果
+func TestUserService_CreateUser_ValidInput_ReturnsUser(t *testing.T) {}
+func TestUserService_CreateUser_DuplicateEmail_ReturnsError(t *testing.T) {}
+func TestUserService_GetUser_UserNotFound_ReturnsError(t *testing.T) {}
+```
+
+### テーブルドリブンテスト
+```go
+func TestUserValidation(t *testing.T) {
+    tests := []struct {
+        name    string
+        input   CreateUserRequest
+        wantErr bool
+        errCode string
+    }{
+        {
+            name: "valid user",
+            input: CreateUserRequest{
+                Name:     "John Doe",
+                Email:    "john@example.com",
+                Password: "password123",
+            },
+            wantErr: false,
+        },
+        {
+            name: "empty name",
+            input: CreateUserRequest{
+                Name:     "",
+                Email:    "john@example.com",
+                Password: "password123",
+            },
+            wantErr: true,
+            errCode: "VALIDATION_ERROR",
+        },
+        {
+            name: "invalid email",
+            input: CreateUserRequest{
+                Name:     "John Doe",
+                Email:    "invalid-email",
+                Password: "password123",
+            },
+            wantErr: true,
+            errCode: "VALIDATION_ERROR",
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            err := ValidateCreateUserRequest(tt.input)
+            
+            if tt.wantErr {
+                assert.Error(t, err)
+                if tt.errCode != "" {
+                    var appErr *AppError
+                    assert.True(t, errors.As(err, &appErr))
+                    assert.Equal(t, tt.errCode, appErr.Code)
+                }
+            } else {
+                assert.NoError(t, err)
+            }
+        })
+    }
+}
+```
+
+### モック使用例
+
+#### サービステスト
+```go
+// internal/usecase/user_service_test.go
+package usecase
+
+import (
+    "context"
+    "testing"
+    "webapi-template/internal/domain/entity"
+    "webapi-template/internal/domain/repository"
+    "webapi-template/pkg/logger"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/mock"
+)
+
+// モックリポジトリ
+type MockUserRepository struct {
+    mock.Mock
+}
+
+func (m *MockUserRepository) Create(ctx context.Context, user *entity.User) error {
+    args := m.Called(ctx, user)
+    return args.Error(0)
+}
+
+func (m *MockUserRepository) FindByID(ctx context.Context, id string) (*entity.User, error) {
+    args := m.Called(ctx, id)
+    return args.Get(0).(*entity.User), args.Error(1)
+}
+
+func (m *MockUserRepository) FindByEmail(ctx context.Context, email string) (*entity.User, error) {
+    args := m.Called(ctx, email)
+    if args.Get(0) == nil {
+        return nil, args.Error(1)
+    }
+    return args.Get(0).(*entity.User), args.Error(1)
+}
+
+// テストケース
+func TestUserService_CreateUser_Success(t *testing.T) {
+    // Arrange
+    mockRepo := new(MockUserRepository)
+    mockLogger := logger.NewNullLogger()
+    service := NewUserService(mockRepo, mockLogger)
+    
+    ctx := context.Background()
+    req := CreateUserRequest{
+        Name:     "John Doe",
+        Email:    "john@example.com",
+        Password: "password123",
+    }
+    
+    // FindByEmailが存在しないユーザーを返すように設定
+    mockRepo.On("FindByEmail", ctx, req.Email).Return(nil, ErrUserNotFound)
+    
+    // Createが成功するように設定
+    mockRepo.On("Create", ctx, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    // Act
+    user, err := service.CreateUser(ctx, req)
+    
+    // Assert
+    assert.NoError(t, err)
+    assert.NotNil(t, user)
+    assert.Equal(t, req.Name, user.Name)
+    assert.Equal(t, req.Email, user.Email)
+    assert.NotEmpty(t, user.Password) // ハッシュ化されているはず
+    
+    mockRepo.AssertExpectations(t)
+}
+```
+
+#### ハンドラーテスト
+```go
+// internal/handler/user_handler_test.go
+package handler
+
+import (
+    "bytes"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "testing"
+    "webapi-template/internal/usecase"
+    "webapi-template/pkg/logger"
+    "github.com/gin-gonic/gin"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/mock"
+)
+
+type MockUserService struct {
+    mock.Mock
+}
+
+func (m *MockUserService) CreateUser(ctx context.Context, req usecase.CreateUserRequest) (*entity.User, error) {
+    args := m.Called(ctx, req)
+    if args.Get(0) == nil {
+        return nil, args.Error(1)
+    }
+    return args.Get(0).(*entity.User), args.Error(1)
+}
+
+func TestUserHandler_CreateUser_Success(t *testing.T) {
+    // Arrange
+    gin.SetMode(gin.TestMode)
+    
+    mockService := new(MockUserService)
+    mockLogger := logger.NewNullLogger()
+    handler := NewUserHandler(mockService, mockLogger)
+    
+    expectedUser := &entity.User{
+        ID:    1,
+        Name:  "John Doe",
+        Email: "john@example.com",
+    }
+    
+    mockService.On("CreateUser", mock.Anything, mock.AnythingOfType("usecase.CreateUserRequest")).
+        Return(expectedUser, nil)
+    
+    // リクエストボディ作成
+    requestBody := CreateUserRequest{
+        Name:     "John Doe",
+        Email:    "john@example.com",
+        Password: "password123",
+    }
+    jsonBody, _ := json.Marshal(requestBody)
+    
+    // HTTPリクエスト作成
+    req, _ := http.NewRequest("POST", "/api/v1/users", bytes.NewBuffer(jsonBody))
+    req.Header.Set("Content-Type", "application/json")
+    
+    recorder := httptest.NewRecorder()
+    
+    // Ginコンテキスト作成
+    c, _ := gin.CreateTestContext(recorder)
+    c.Request = req
+    
+    // Act
+    handler.CreateUser(c)
+    
+    // Assert
+    assert.Equal(t, http.StatusCreated, recorder.Code)
+    
+    var response SuccessResponse
+    err := json.Unmarshal(recorder.Body.Bytes(), &response)
+    assert.NoError(t, err)
+    
+    userData := response.Data.(map[string]interface{})
+    assert.Equal(t, float64(1), userData["id"])
+    assert.Equal(t, "John Doe", userData["name"])
+    assert.Equal(t, "john@example.com", userData["email"])
+    
+    mockService.AssertExpectations(t)
+}
+```
+
+## 統合テスト（Integration Test）
+
+### データベース統合テスト
+```go
+// tests/integration/user_repository_test.go
+package integration
+
+import (
+    "context"
+    "testing"
+    "webapi-template/internal/domain/entity"
+    "webapi-template/internal/infrastructure/database"
+    "webapi-template/tests/testutils"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/suite"
+)
+
+type UserRepositoryIntegrationTestSuite struct {
+    suite.Suite
+    db   *gorm.DB
+    repo repository.UserRepository
+}
+
+func (suite *UserRepositoryIntegrationTestSuite) SetupSuite() {
+    // テスト用データベース接続
+    db, err := testutils.SetupTestDB()
+    suite.Require().NoError(err)
+    
+    suite.db = db
+    suite.repo = database.NewUserRepository(db)
+}
+
+func (suite *UserRepositoryIntegrationTestSuite) TearDownSuite() {
+    testutils.CleanupTestDB(suite.db)
+}
+
+func (suite *UserRepositoryIntegrationTestSuite) SetupTest() {
+    // 各テスト前にデータをクリア
+    suite.db.Exec("TRUNCATE TABLE users RESTART IDENTITY CASCADE")
+}
+
+func (suite *UserRepositoryIntegrationTestSuite) TestCreateUser_Success() {
+    // Arrange
+    user := &entity.User{
+        Name:     "John Doe",
+        Email:    "john@example.com",
+        Password: "hashedpassword",
+    }
+    
+    // Act
+    err := suite.repo.Create(context.Background(), user)
+    
+    // Assert
+    assert.NoError(suite.T(), err)
+    assert.NotZero(suite.T(), user.ID)
+    assert.NotZero(suite.T(), user.CreatedAt)
+}
+
+func TestUserRepositoryIntegrationTestSuite(t *testing.T) {
+    suite.Run(t, new(UserRepositoryIntegrationTestSuite))
+}
+```
+
+### API統合テスト
+```go
+// tests/integration/api_test.go
+package integration
+
+import (
+    "bytes"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "testing"
+    "webapi-template/cmd/server"
+    "webapi-template/tests/testutils"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/suite"
+)
+
+type APIIntegrationTestSuite struct {
+    suite.Suite
+    server *httptest.Server
+    db     *gorm.DB
+}
+
+func (suite *APIIntegrationTestSuite) SetupSuite() {
+    // テスト用アプリケーション起動
+    db, err := testutils.SetupTestDB()
+    suite.Require().NoError(err)
+    
+    suite.db = db
+    
+    // サーバー起動
+    app := server.NewApp(db)
+    suite.server = httptest.NewServer(app)
+}
+
+func (suite *APIIntegrationTestSuite) TearDownSuite() {
+    suite.server.Close()
+    testutils.CleanupTestDB(suite.db)
+}
+
+func (suite *APIIntegrationTestSuite) TestCreateUser_API() {
+    // Arrange
+    requestBody := map[string]interface{}{
+        "name":     "John Doe",
+        "email":    "john@example.com",
+        "password": "password123",
+    }
+    jsonBody, _ := json.Marshal(requestBody)
+    
+    // Act
+    resp, err := http.Post(
+        suite.server.URL+"/api/v1/users",
+        "application/json",
+        bytes.NewBuffer(jsonBody),
+    )
+    
+    // Assert
+    assert.NoError(suite.T(), err)
+    assert.Equal(suite.T(), http.StatusCreated, resp.StatusCode)
+    
+    var response map[string]interface{}
+    err = json.NewDecoder(resp.Body).Decode(&response)
+    assert.NoError(suite.T(), err)
+    
+    data := response["data"].(map[string]interface{})
+    assert.Equal(suite.T(), "John Doe", data["name"])
+    assert.Equal(suite.T(), "john@example.com", data["email"])
+}
+
+func TestAPIIntegrationTestSuite(t *testing.T) {
+    suite.Run(t, new(APIIntegrationTestSuite))
+}
+```
+
+## テストユーティリティ
+
+### テスト用データベース設定
+```go
+// tests/testutils/database.go
+package testutils
+
+import (
+    "fmt"
+    "webapi-template/internal/infrastructure/database"
+    "webapi-template/migrations"
+    "gorm.io/gorm"
+)
+
+func SetupTestDB() (*gorm.DB, error) {
+    config := database.Config{
+        Host:     "localhost",
+        Port:     5432,
+        User:     "test",
+        Password: "test",
+        DBName:   "test_db",
+        SSLMode:  "disable",
+        TimeZone: "UTC",
+    }
+    
+    db, err := database.NewPostgresDB(config)
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to test database: %w", err)
+    }
+    
+    // マイグレーション実行
+    if err := migrations.AutoMigrate(db); err != nil {
+        return nil, fmt.Errorf("failed to migrate test database: %w", err)
+    }
+    
+    return db, nil
+}
+
+func CleanupTestDB(db *gorm.DB) {
+    sqlDB, _ := db.DB()
+    sqlDB.Close()
+}
+```
+
+### テストデータファクトリー
+```go
+// tests/testutils/factories.go
+package testutils
+
+import (
+    "webapi-template/internal/domain/entity"
+    "github.com/bxcodec/faker/v3"
+)
+
+func CreateTestUser() *entity.User {
+    return &entity.User{
+        Name:     faker.Name(),
+        Email:    faker.Email(),
+        Password: "hashedpassword",
+        Role:     entity.UserRoleUser,
+    }
+}
+
+func CreateTestUserWithEmail(email string) *entity.User {
+    user := CreateTestUser()
+    user.Email = email
+    return user
+}
+
+func CreateTestPost(userID string) *entity.Post {
+    return &entity.Post{
+        Title:   faker.Sentence(),
+        Content: faker.Paragraph(),
+        UserID:  userID,
+    }
+}
+```
+
+## E2Eテスト
+
+### E2Eテストの設定
+```go
+// tests/e2e/user_flow_test.go
+package e2e
+
+import (
+    "testing"
+    "webapi-template/tests/testutils"
+    "github.com/stretchr/testify/suite"
+)
+
+type UserFlowTestSuite struct {
+    suite.Suite
+    app    *testutils.TestApp
+    client *testutils.APIClient
+}
+
+func (suite *UserFlowTestSuite) SetupSuite() {
+    suite.app = testutils.NewTestApp()
+    suite.client = testutils.NewAPIClient(suite.app.Server.URL)
+}
+
+func (suite *UserFlowTestSuite) TearDownSuite() {
+    suite.app.Cleanup()
+}
+
+func (suite *UserFlowTestSuite) TestUserRegistrationFlow() {
+    // 1. ユーザー登録
+    registerReq := map[string]interface{}{
+        "name":     "John Doe",
+        "email":    "john@example.com",
+        "password": "password123",
+    }
+    
+    user, err := suite.client.CreateUser(registerReq)
+    suite.Require().NoError(err)
+    suite.Equal("John Doe", user.Name)
+    
+    // 2. ログイン
+    loginReq := map[string]interface{}{
+        "email":    "john@example.com",
+        "password": "password123",
+    }
+    
+    token, err := suite.client.Login(loginReq)
+    suite.Require().NoError(err)
+    suite.NotEmpty(token)
+    
+    // 3. プロフィール取得
+    profile, err := suite.client.GetProfile(token)
+    suite.Require().NoError(err)
+    suite.Equal("john@example.com", profile.Email)
+    
+    // 4. プロフィール更新
+    updateReq := map[string]interface{}{
+        "name": "John Smith",
+    }
+    
+    updatedProfile, err := suite.client.UpdateProfile(token, updateReq)
+    suite.Require().NoError(err)
+    suite.Equal("John Smith", updatedProfile.Name)
+}
+
+func TestUserFlowTestSuite(t *testing.T) {
+    suite.Run(t, new(UserFlowTestSuite))
+}
+```
+
+## テスト実行設定
+
+### Makefile
+```makefile
+# テスト関連コマンド
+.PHONY: test test-unit test-integration test-e2e test-coverage
+
+test: test-unit test-integration
+
+test-unit:
+	go test -v -race ./internal/...
+
+test-integration:
+	go test -v -race ./tests/integration/...
+
+test-e2e:
+	go test -v -race ./tests/e2e/...
+
+test-coverage:
+	go test -v -race -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
+
+test-db-setup:
+	docker run -d --name test-postgres \
+		-e POSTGRES_DB=test_db \
+		-e POSTGRES_USER=test \
+		-e POSTGRES_PASSWORD=test \
+		-p 5433:5432 \
+		postgres:17
+
+test-db-cleanup:
+	docker stop test-postgres && docker rm test-postgres
+```
+
+## テスト アンチパターン対策
+
+### Ice Cream Cone アンチパターンの回避
+
+#### ❌ Bad: 逆ピラミッド（Ice Cream Cone）
+```
+      /\
+     /  \
+    / UI \       ← E2Eテストが多すぎる（遅い、脆い）
+   /______\
+  /        \
+ /Integration\ ← 統合テストが中程度
+/____________\
+/   Unit     \  ← 単体テストが少ない
+/_____________\
+```
+
+```go
+// Bad: E2Eテストに依存しすぎ
+func TestCreateUser_E2E(t *testing.T) {
+    // 毎回DBやサーバーを起動（遅い）
+    server := startTestServer()
+    defer server.Close()
+    
+    // HTTPリクエストを送信（ネットワーク経由で遅い）
+    resp, err := http.Post(server.URL+"/users", "application/json", strings.NewReader(`{
+        "name": "John",
+        "email": "john@example.com"
+    }`))
+    // ... 複雑なレスポンス検証
+}
+```
+
+#### ✅ Good: 正しいテストピラミッド
+```go
+// Good: 単体テストを充実させる（早い、安定）
+func TestUserService_CreateUser_Success(t *testing.T) {
+    mockRepo := new(MockUserRepository)
+    service := NewUserService(mockRepo, logger.NewNullLogger())
+    
+    mockRepo.On("FindByEmail", mock.Anything, "john@example.com").Return(nil, ErrUserNotFound)
+    mockRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    user, err := service.CreateUser(context.Background(), CreateUserRequest{
+        Name:  "John",
+        Email: "john@example.com",
+    })
+    
+    assert.NoError(t, err)
+    assert.Equal(t, "John", user.Name)
+    mockRepo.AssertExpectations(t)
+}
+
+// 統合テストは重要な部分のみ
+func TestUserRepository_Integration(t *testing.T) {
+    db := setupTestDB(t)
+    repo := NewUserRepository(db)
+    
+    user := &entity.User{Name: "John", Email: "john@example.com"}
+    err := repo.Create(context.Background(), user)
+    assert.NoError(t, err)
+    
+    found, err := repo.FindByEmail(context.Background(), "john@example.com")
+    assert.NoError(t, err)
+    assert.Equal(t, "John", found.Name)
+}
+```
+
+### 脆いテスト（Brittle Tests）の回避
+
+#### ❌ Bad: 実装詳細に依存するテスト
+```go
+// Bad: 内部実装に強く依存
+func TestUserService_CreateUser_BadTest(t *testing.T) {
+    mockRepo := new(MockUserRepository)
+    service := NewUserService(mockRepo, logger.NewNullLogger())
+    
+    // 呼び出し順序に依存（脆い）
+    mockRepo.On("FindByEmail", mock.Anything, "john@example.com").Return(nil, ErrUserNotFound).Once()
+    mockRepo.On("ValidateEmail", "john@example.com").Return(true).Once() // 内部実装に依存
+    mockRepo.On("HashPassword", "password").Return("hashed", nil).Once()  // 実装詳細
+    mockRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil).Once()
+    
+    // 特定の順序でメソッドが呼ばれることを期待
+    user, err := service.CreateUser(context.Background(), CreateUserRequest{
+        Name:     "John",
+        Email:    "john@example.com", 
+        Password: "password",
+    })
+    
+    assert.NoError(t, err)
+    // 内部フィールドの詳細検証（脆い）
+    assert.Equal(t, "hashed", user.Password)
+    mockRepo.AssertExpectations(t)
+}
+```
+
+#### ✅ Good: 振る舞いに焦点を当てたテスト
+```go
+// Good: 公開インターフェースと結果に焦点
+func TestUserService_CreateUser_RobustTest(t *testing.T) {
+    mockRepo := new(MockUserRepository)
+    service := NewUserService(mockRepo, logger.NewNullLogger())
+    
+    // 必要最小限のモック設定
+    mockRepo.On("FindByEmail", mock.Anything, "john@example.com").Return(nil, ErrUserNotFound)
+    mockRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    // 振る舞いのテスト
+    user, err := service.CreateUser(context.Background(), CreateUserRequest{
+        Name:     "John",
+        Email:    "john@example.com",
+        Password: "password",
+    })
+    
+    // 結果の検証（実装詳細ではなく）
+    assert.NoError(t, err)
+    assert.Equal(t, "John", user.Name)
+    assert.Equal(t, "john@example.com", user.Email)
+    assert.NotEmpty(t, user.Password) // パスワードがハッシュ化されていること
+    assert.NotEqual(t, "password", user.Password) // 平文ではないこと
+    
+    mockRepo.AssertExpectations(t)
+}
+```
+
+### テストコード重複の回避
+
+#### ❌ Bad: テストコードの重複
+```go
+// Bad: 同じセットアップコードの重複
+func TestUserService_CreateUser_ValidEmail(t *testing.T) {
+    // 重複するセットアップ
+    mockRepo := new(MockUserRepository)
+    mockLogger := logger.NewNullLogger()
+    service := NewUserService(mockRepo, mockLogger)
+    
+    mockRepo.On("FindByEmail", mock.Anything, "valid@example.com").Return(nil, ErrUserNotFound)
+    mockRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    user, err := service.CreateUser(context.Background(), CreateUserRequest{
+        Name:  "John",
+        Email: "valid@example.com",
+    })
+    
+    assert.NoError(t, err)
+    assert.Equal(t, "John", user.Name)
+}
+
+func TestUserService_CreateUser_AnotherValidCase(t *testing.T) {
+    // 同じセットアップコードが重複
+    mockRepo := new(MockUserRepository)
+    mockLogger := logger.NewNullLogger()
+    service := NewUserService(mockRepo, mockLogger)
+    
+    mockRepo.On("FindByEmail", mock.Anything, "another@example.com").Return(nil, ErrUserNotFound)
+    mockRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil)
+    
+    // ...
+}
+```
+
+#### ✅ Good: テストユーティリティとテーブルドリブン
+```go
+// Good: 共通セットアップの抽出
+type userServiceTestSuite struct {
+    mockRepo   *MockUserRepository
+    mockLogger logger.Logger
+    service    *UserService
+}
+
+func setupUserServiceTest(t *testing.T) *userServiceTestSuite {
+    suite := &userServiceTestSuite{
+        mockRepo:   new(MockUserRepository),
+        mockLogger: logger.NewNullLogger(),
+    }
+    suite.service = NewUserService(suite.mockRepo, suite.mockLogger)
+    return suite
+}
+
+// テーブルドリブンテストで重複を削減
+func TestUserService_CreateUser(t *testing.T) {
+    tests := []struct {
+        name       string
+        request    CreateUserRequest
+        setupMocks func(*MockUserRepository)
+        wantErr    bool
+        wantUser   func(*entity.User) bool
+    }{
+        {
+            name: "valid user creation",
+            request: CreateUserRequest{
+                Name:  "John",
+                Email: "john@example.com",
+            },
+            setupMocks: func(repo *MockUserRepository) {
+                repo.On("FindByEmail", mock.Anything, "john@example.com").Return(nil, ErrUserNotFound)
+                repo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil)
+            },
+            wantErr: false,
+            wantUser: func(user *entity.User) bool {
+                return user.Name == "John" && user.Email == "john@example.com"
+            },
+        },
+        {
+            name: "duplicate email",
+            request: CreateUserRequest{
+                Name:  "Jane",
+                Email: "duplicate@example.com",
+            },
+            setupMocks: func(repo *MockUserRepository) {
+                repo.On("FindByEmail", mock.Anything, "duplicate@example.com").Return(&entity.User{}, nil)
+            },
+            wantErr: true,
+        },
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            suite := setupUserServiceTest(t)
+            tt.setupMocks(suite.mockRepo)
+            
+            user, err := suite.service.CreateUser(context.Background(), tt.request)
+            
+            if tt.wantErr {
+                assert.Error(t, err)
+            } else {
+                assert.NoError(t, err)
+                if tt.wantUser != nil {
+                    assert.True(t, tt.wantUser(user))
+                }
+            }
+            
+            suite.mockRepo.AssertExpectations(t)
+        })
+    }
+}
+```
+
+### 遅いテストの回避
+
+#### ❌ Bad: 不要に遅いテスト
+```go
+// Bad: 実際のHTTPリクエストを送信（遅い）
+func TestUserAPI_SlowTest(t *testing.T) {
+    server := httptest.NewServer(createRouter())
+    defer server.Close()
+    
+    // 実際のHTTPクライアントを使用（遅い）
+    resp, err := http.Post(server.URL+"/users", "application/json", 
+        strings.NewReader(`{"name":"John","email":"john@example.com"}`))
+    assert.NoError(t, err)
+    
+    // レスポンスボディを読み取り（IO操作）
+    body, _ := ioutil.ReadAll(resp.Body)
+    var user entity.User
+    json.Unmarshal(body, &user)
+    
+    assert.Equal(t, "John", user.Name)
+}
+
+// Bad: 不要なSleep（遅い）
+func TestAsyncOperation_BadTest(t *testing.T) {
+    service := NewAsyncService()
+    service.StartAsyncOperation()
+    
+    // 固定のSleep（遅い、不安定）
+    time.Sleep(5 * time.Second)
+    
+    result := service.GetResult()
+    assert.True(t, result.IsCompleted)
+}
+```
+
+#### ✅ Good: 高速なテスト
+```go
+// Good: ginのテストコンテキストを使用（高速）
+func TestUserHandler_CreateUser_FastTest(t *testing.T) {
+    mockService := new(MockUserService)
+    handler := NewUserHandler(mockService, logger.NewNullLogger())
+    
+    mockService.On("CreateUser", mock.Anything, mock.AnythingOfType("CreateUserRequest")).
+        Return(&entity.User{Name: "John", Email: "john@example.com"}, nil)
+    
+    // HTTP テストレコーダー使用（メモリ内、高速）
+    w := httptest.NewRecorder()
+    c, _ := gin.CreateTestContext(w)
+    
+    // リクエストボディを設定
+    reqBody := `{"name":"John","email":"john@example.com"}`
+    c.Request = httptest.NewRequest("POST", "/users", strings.NewReader(reqBody))
+    c.Request.Header.Set("Content-Type", "application/json")
+    
+    handler.CreateUser(c)
+    
+    assert.Equal(t, http.StatusCreated, w.Code)
+    mockService.AssertExpectations(t)
+}
+
+// Good: 適切な同期機構を使用
+func TestAsyncOperation_GoodTest(t *testing.T) {
+    service := NewAsyncService()
+    
+    // チャネルやWaitGroupで同期
+    done := make(chan bool, 1)
+    service.StartAsyncOperationWithCallback(func() {
+        done <- true
+    })
+    
+    // タイムアウト付きで待機
+    select {
+    case <-done:
+        result := service.GetResult()
+        assert.True(t, result.IsCompleted)
+    case <-time.After(1 * time.Second):
+        t.Fatal("Operation timed out")
+    }
+}
+```
+
+### Implementation Details のテスト回避
+
+#### ❌ Bad: 実装詳細のテスト
+```go
+// Bad: プライベートメソッドのテスト
+func TestUserService_validatePassword(t *testing.T) {
+    service := NewUserService(nil, nil)
+    
+    // プライベートメソッドを直接テスト（危険）
+    isValid := service.validatePassword("password123")
+    assert.True(t, isValid)
+}
+
+// Bad: 内部状態の詳細検証
+func TestUserService_InternalState(t *testing.T) {
+    service := NewUserService(mockRepo, mockLogger)
+    
+    service.CreateUser(context.Background(), req)
+    
+    // 内部フィールドへの直接アクセス（脆い）
+    assert.Equal(t, 1, service.createdUserCount) // 内部実装に依存
+    assert.True(t, service.isInitialized)        // 実装詳細
+}
+```
+
+#### ✅ Good: 公開インターフェースのテスト
+```go
+// Good: 公開メソッドを通じた間接テスト
+func TestUserService_PasswordValidation(t *testing.T) {
+    mockRepo := new(MockUserRepository)
+    service := NewUserService(mockRepo, logger.NewNullLogger())
+    
+    tests := []struct {
+        name     string
+        password string
+        wantErr  bool
+        errCode  string
+    }{
+        {
+            name:     "valid password",
+            password: "validPass123",
+            wantErr:  false,
+        },
+        {
+            name:     "too short password",
+            password: "123",
+            wantErr:  true,
+            errCode:  "INVALID_PASSWORD",
+        },
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            mockRepo.On("FindByEmail", mock.Anything, "test@example.com").Return(nil, ErrUserNotFound)
+            if !tt.wantErr {
+                mockRepo.On("Create", mock.Anything, mock.AnythingOfType("*entity.User")).Return(nil)
+            }
+            
+            // 公開メソッドを通じてパスワード検証をテスト
+            _, err := service.CreateUser(context.Background(), CreateUserRequest{
+                Name:     "Test",
+                Email:    "test@example.com",
+                Password: tt.password,
+            })
+            
+            if tt.wantErr {
+                assert.Error(t, err)
+                var appErr *AppError
+                if errors.As(err, &appErr) {
+                    assert.Equal(t, tt.errCode, appErr.Code)
+                }
+            } else {
+                assert.NoError(t, err)
+            }
+            
+            mockRepo.AssertExpectations(t)
+        })
+    }
+}
+```
+
