@@ -1,4 +1,4 @@
-# WebAPI Template
+# webapi-template-cursor
 
 Clean Architecture ベースの Go WebAPI テンプレートです。
 

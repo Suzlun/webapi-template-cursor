@@ -26,7 +26,7 @@ alwaysApply: false
 # api/openapi.yaml
 openapi: 3.0.3
 info:
-  title: WebAPI Template
+  title: webapi-template-cursor
   description: |
     Clean Architecture ベースの WebAPI テンプレート
     - CockroachDB v25.2 (PostgreSQL互換)
@@ -749,7 +749,7 @@ import (
     ginSwagger "github.com/swaggo/gin-swagger"
 )
 
-// @title WebAPI Template
+// @title webapi-template-cursor
 // @version 1.0
 // @description WebAPI Server Template with Go, gin, GORM
 // @termsOfService http://swagger.io/terms/
@@ -770,7 +770,7 @@ import (
 
 func main() {
     // Swagger の設定
-    docs.SwaggerInfo.Title = "WebAPI Template"
+    docs.SwaggerInfo.Title = "webapi-template-cursor"
     docs.SwaggerInfo.Description = "WebAPI Server Template with Go, gin, GORM"
     docs.SwaggerInfo.Version = "1.0"
     docs.SwaggerInfo.Host = "localhost:8080"

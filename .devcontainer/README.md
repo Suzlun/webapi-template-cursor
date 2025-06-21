@@ -1,6 +1,6 @@
 # DevContainer 設定
 
-WebAPI Template プロジェクトの DevContainer 設定一式です。
+webapi-template-cursor プロジェクトの DevContainer 設定一式です。
 
 ## 📁 ディレクトリ構造
 
@@ -114,16 +114,16 @@ environment:
 
 ## 🌐 アクセス可能サービス
 
-| サービス          | ポート | URL                        | 用途                   |
-| ----------------- | ------ | -------------------------- | ---------------------- |
-| API Server        | 8080   | http://localhost:8080      | メインアプリケーション |
-| Swagger UI        | 8081   | http://localhost:8081      | API ドキュメント       |
-| CockroachDB Admin | 8090   | http://localhost:8090      | DB 管理                |
-| CockroachDB SQL   | 26257  | `cockroach sql --insecure` | DB 接続                |
-| Redis             | 6379   | `redis-cli -h redis`       | キャッシュ             |
-| Jaeger UI         | 16686  | http://localhost:16686     | 分散トレーシング       |
+| サービス          | ポート | URL                        | 用途                                       |
+| ----------------- | ------ | -------------------------- | ------------------------------------------ |
+| API Server        | 8080   | http://localhost:8080      | メインアプリケーション                     |
+| Swagger UI        | 8081   | http://localhost:8081      | API ドキュメント                           |
+| CockroachDB Admin | 8090   | http://localhost:8090      | DB 管理                                    |
+| CockroachDB SQL   | 26257  | `cockroach sql --insecure` | DB 接続                                    |
+| Redis             | 6379   | `redis-cli -h redis`       | キャッシュ                                 |
+| Jaeger UI         | 16686  | http://localhost:16686     | 分散トレーシング                           |
 | pgAdmin           | 5050   | http://localhost:5050      | DB 管理ツール (admin@example.com/admin123) |
-| Redis Commander   | 8082   | http://localhost:8082      | Redis 管理             |
+| Redis Commander   | 8082   | http://localhost:8082      | Redis 管理                                 |
 
 ## 🛠️ トラブルシューティング
 

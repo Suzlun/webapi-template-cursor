@@ -1,5 +1,5 @@
 {
-  "name": "WebAPI Template Development",
+  "name": "webapi-template-cursor",
   "dockerComposeFile": "./docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspace",

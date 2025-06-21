@@ -1,4 +1,4 @@
-# WebAPI Template 開発用コマンドヒストリー
+# webapi-template-cursor 開発用コマンドヒストリー
 make help
 make dev
 make test

@@ -1,5 +1,5 @@
 # =============================================================================
-# WebAPI Template - Makefile
+# webapi-template-cursor - Makefile
 # =============================================================================
 
 .PHONY: help dev build test clean install-tools setup-hooks
