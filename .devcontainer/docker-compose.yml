@@ -1,0 +1,154 @@
+services:
+  # Go アプリケーション開発環境
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    volumes:
+      - ..:/workspace:cached
+      - go-mod-cache:/go/pkg/mod
+      - go-build-cache:/root/.cache/go-build
+    environment:
+      - GO111MODULE=on
+      - GOPROXY=https://proxy.golang.org,direct
+      - GOSUMDB=sum.golang.org
+      - CGO_ENABLED=0
+      # データベース接続（CockroachDB）
+      - DATABASE_URL=postgres://root@cockroachdb:26257/webapi_dev?sslmode=disable
+      - DB_HOST=cockroachdb
+      - DB_PORT=26257
+      - DB_USER=root
+      - DB_PASSWORD=
+      - DB_NAME=webapi_dev
+      - DB_SSLMODE=disable
+      # Redis接続
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      # 開発環境設定
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+      - GIN_MODE=debug
+      # OpenTelemetry設定
+      - OTEL_SERVICE_NAME=webapi-template-dev
+      - OTEL_SERVICE_VERSION=dev
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:14268/api/traces
+      - OTEL_EXPORTER_JAEGER_ENDPOINT=http://jaeger:14268/api/traces
+    ports:
+      - "8080:8080" # API Server
+      - "8081:8081" # Swagger UI
+    depends_on:
+      - cockroachdb
+      - redis
+      - jaeger
+    networks:
+      - webapi-network
+    command: sleep infinity
+    tty: true
+    stdin_open: true
+
+  # CockroachDB v25.2（PostgreSQL互換分散データベース）
+  cockroachdb:
+    image: cockroachdb/cockroach:v25.2.0
+    ports:
+      - "26257:26257" # SQL port
+      - "8090:8080" # Admin UI port (ポート競合回避)
+    command: start-single-node --insecure
+    environment:
+      - COCKROACH_DATABASE=webapi_dev
+      - COCKROACH_USER=root
+      - port=26257
+      - http_port=8080
+    volumes:
+      - cockroachdb-data:/cockroach/cockroach-data
+      - ./config/database/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health?ready=1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - webapi-network
+
+  # Redis 7+ キャッシュ・セッションストア
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ""
+    volumes:
+      - redis-data:/data
+      - ./config/cache/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - webapi-network
+
+  # Jaeger - 分散トレーシング
+  jaeger:
+    image: jaegertracing/all-in-one:1.52
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "14268:14268" # Jaeger HTTP collector
+      - "14250:14250" # Jaeger gRPC collector
+      - "6831:6831/udp" # Jaeger agent
+      - "6832:6832/udp" # Jaeger agent
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+    networks:
+      - webapi-network
+
+  # PostgreSQL Admin (pgAdmin) - CockroachDB管理用
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    ports:
+      - "5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=admin123
+      - PGADMIN_CONFIG_SERVER_MODE=False
+      - PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED=False
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./config/database/pgadmin-servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      - cockroachdb
+    networks:
+      - webapi-network
+
+  # Redis Commander - Redis管理用
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    ports:
+      - "8082:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+      - HTTP_USER=admin
+      - HTTP_PASSWORD=admin123
+    depends_on:
+      - redis
+    networks:
+      - webapi-network
+
+volumes:
+  go-mod-cache:
+    driver: local
+  go-build-cache:
+    driver: local
+  cockroachdb-data:
+    driver: local
+  redis-data:
+    driver: local
+  pgadmin-data:
+    driver: local
+
+networks:
+  webapi-network:
+    driver: bridge

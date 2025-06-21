@@ -1,0 +1,174 @@
+{
+  "name": "WebAPI Template Development",
+  "dockerComposeFile": "./docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  
+  // VS Code設定
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // Go言語サポート
+        "golang.go",
+        "golang.go-nightly",
+        
+        // API開発
+        "humao.rest-client",
+        "42crunch.vscode-openapi",
+        "ms-vscode.vscode-json",
+        
+        // データベース
+        "ms-vscode.vscode-postgresql",
+        "cweijan.vscode-redis-client",
+        
+        // Docker & Kubernetes
+        "ms-azuretools.vscode-docker",
+        "ms-kubernetes-tools.vscode-kubernetes-tools",
+        
+        // Git
+        "eamodio.gitlens",
+        "github.vscode-pull-request-github",
+        
+        // テスト & 品質
+        "hbenl.vscode-test-explorer",
+        "emeraldwalk.runonsave",
+        "bradlc.vscode-tailwindcss",
+        
+        // ユーティリティ
+        "ms-vscode.vscode-yaml",
+        "redhat.vscode-xml",
+        "ms-vscode.hexeditor",
+        "vscodevim.vim"
+      ],
+      
+      "settings": {
+        // Go設定
+        "go.useLanguageServer": true,
+        "go.languageServerExperimentalFeatures": {
+          "diagnostics": true,
+          "documentLink": true
+        },
+        "go.lintTool": "golangci-lint",
+        "go.lintFlags": ["--fast"],
+        "go.formatTool": "goimports",
+        "go.testFlags": ["-v", "-race"],
+        "go.testTimeout": "30s",
+        "go.coverOnSave": true,
+        "go.coverageDecorator": {
+          "type": "gutter",
+          "coveredHighlightColor": "rgba(64,128,128,0.5)",
+          "uncoveredHighlightColor": "rgba(128,64,64,0.25)"
+        },
+        
+        // エディタ設定
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": "explicit"
+        },
+        "editor.rulers": [100, 120],
+        "editor.insertSpaces": true,
+        "editor.tabSize": 4,
+        
+        // ファイル設定
+        "files.eol": "\n",
+        "files.insertFinalNewline": true,
+        "files.trimTrailingWhitespace": true,
+        "files.exclude": {
+          "**/vendor/**": true,
+          "**/node_modules/**": true,
+          "**/.git/**": true
+        },
+        
+        // 検索設定
+        "search.exclude": {
+          "**/vendor/**": true,
+          "**/node_modules/**": true,
+          "**/dist/**": true,
+          "**/coverage/**": true
+        },
+        
+        // ターミナル設定
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.fontSize": 14,
+        
+        // デバッグ設定
+        "debug.internalConsoleOptions": "openOnSessionStart"
+      }
+    }
+  },
+  
+  // コンテナ作成後のコマンド
+  "postCreateCommand": ".devcontainer/scripts/setup.sh",
+  
+  // ポートフォワーディング
+  "forwardPorts": [
+    8080,   // API Server
+    8081,   // Swagger UI
+    8090,   // CockroachDB Admin UI
+    26257,  // CockroachDB SQL
+    6379,   // Redis
+    16686   // Jaeger UI
+  ],
+  "portsAttributes": {
+    "8080": {
+      "label": "API Server",
+      "onAutoForward": "notify"
+    },
+    "8081": {
+      "label": "Swagger UI",
+      "onAutoForward": "silent"
+    },
+    "8090": {
+      "label": "CockroachDB Admin UI",
+      "onAutoForward": "silent"
+    },
+    "26257": {
+      "label": "CockroachDB SQL",
+      "onAutoForward": "silent"
+    },
+    "6379": {
+      "label": "Redis",
+      "onAutoForward": "silent"
+    },
+    "16686": {
+      "label": "Jaeger UI",
+      "onAutoForward": "silent"
+    }
+  },
+  
+  // コンテナユーザー設定
+  "remoteUser": "vscode",
+  
+  // マウント設定
+  "mounts": [
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+    "source=${localWorkspaceFolder}/.devcontainer/config/shell/zsh_history,target=/home/vscode/.zsh_history,type=bind,consistency=cached"
+  ],
+  
+  // 機能追加
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true,
+      "installOhMyZsh": true,
+      "upgradePackages": true,
+      "username": "vscode",
+      "userUid": "1000",
+      "userGid": "1000"
+    },
+    "ghcr.io/devcontainers/features/git:1": {
+      "ppa": true,
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "installDirectlyFromGitHubRelease": true,
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": true,
+      "azureDnsAutoDetection": true,
+      "installDockerBuildx": true,
+      "version": "latest"
+    }
+  }
+} 

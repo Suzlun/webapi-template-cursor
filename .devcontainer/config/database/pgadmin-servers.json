@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "CockroachDB Development",
+      "Group": "Servers",
+      "Host": "cockroachdb",
+      "Port": 26257,
+      "MaintenanceDB": "webapi_dev",
+      "Username": "root",
+      "Password": "",
+      "SSLMode": "disable",
+      "Comment": "CockroachDB v25.2 Development Database"
+    }
+  }
+} 
