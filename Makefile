@@ -70,6 +70,44 @@ swagger: ## Swagger ドキュメントを生成
 		echo "⚠️  swagがインストールされていません。すでにインストール済みです"; \
 	fi
 
+# Git設定
+git-status: ## Git設定を確認
+	@echo "🔍 Git設定を確認中..."
+	@echo "Git Version: $(shell git --version)"
+	@echo "User Name: $(shell git config --global user.name || echo '未設定')"
+	@echo "User Email: $(shell git config --global user.email || echo '未設定')"
+	@echo "Core Editor: $(shell git config --global core.editor || echo '未設定')"
+	@echo "Default Branch: $(shell git config --global init.defaultBranch || echo '未設定')"
+	@echo "Credential Helper: $(shell git config --global credential.helper || echo '未設定')"
+	@if [ -n "$$SSH_AUTH_SOCK" ]; then \
+		echo "SSH Agent: 利用可能"; \
+		if ssh-add -l >/dev/null 2>&1; then \
+			echo "SSH Keys: $(shell ssh-add -l | wc -l) 個のキーが利用可能"; \
+		else \
+			echo "SSH Keys: キーが読み込まれていません"; \
+		fi; \
+	else \
+		echo "SSH Agent: 利用不可"; \
+	fi
+
+git-setup: ## Git設定を対話的に設定
+	@echo "🛠️  Git設定を開始します..."
+	@read -p "Git User Name: " name && git config --global user.name "$$name"
+	@read -p "Git User Email: " email && git config --global user.email "$$email"
+	@git config --global init.defaultBranch main
+	@git config --global push.default simple
+	@git config --global pull.rebase false
+	@git config --global core.autocrlf input
+	@git config --global core.editor "code --wait"
+	@git config --global credential.helper store
+	@echo "✅ Git設定完了"
+
+git-reset: ## Git設定をリセット
+	@echo "⚠️  Git設定をリセットします..."
+	@read -p "本当にリセットしますか？ (y/N): " confirm && [ "$$confirm" = "y" ] || exit 1
+	@rm -f ~/.gitconfig
+	@echo "✅ Git設定をリセットしました"
+
 # クリーンアップ
 clean: ## 生成ファイルを削除
 	rm -rf bin/ tmp/ coverage.out coverage.html 

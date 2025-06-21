@@ -97,6 +97,9 @@
     }
   },
   
+  // コンテナ作成前のホスト側コマンド（Git設定の準備）
+  "initializeCommand": "if [ -f ~/.gitconfig ]; then cp ~/.gitconfig .devcontainer/host-git-config; else echo 'No ~/.gitconfig found'; fi",
+  
   // コンテナ作成後のコマンド
   "postCreateCommand": ".devcontainer/scripts/setup.sh",
   
@@ -139,10 +142,16 @@
   // コンテナユーザー設定
   "remoteUser": "vscode",
   
+  // Git設定共有のための環境変数
+  "remoteEnv": {
+    "GIT_EDITOR": "code --wait"
+  },
+  
   // マウント設定
   "mounts": [
     "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
-    "source=${localWorkspaceFolder}/.devcontainer/config/shell/zsh_history,target=/home/vscode/.zsh_history,type=bind,consistency=cached"
+    "source=${localWorkspaceFolder}/.devcontainer/config/shell/zsh_history,target=/home/vscode/.zsh_history,type=bind,consistency=cached",
+    "source=${localWorkspaceFolder}/.devcontainer/host-git-config,target=/tmp/.gitconfig-host,type=bind,consistency=cached"
   ],
   
   // 機能追加

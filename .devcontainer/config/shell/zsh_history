@@ -14,4 +14,4 @@ curl http://localhost:8080/health
 curl http://localhost:8080/api/v1/users
 git status
 git add .
-git commit -m "Initial commit" 
+git commit -m "Initial commit" : 1750519835:0;git commit -m "add git setting"

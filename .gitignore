@@ -59,4 +59,8 @@ server
 node_modules/
 
 # Redis dump
-dump.rdb 
+dump.rdb
+
+# DevContainer files
+.devcontainer/host-git-config
+.devcontainer/config/shell/zsh_history 

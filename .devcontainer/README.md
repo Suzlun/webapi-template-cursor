@@ -150,3 +150,260 @@ docker-compose -f .devcontainer/docker-compose.yml logs [service_name]
 - [詳細セットアップガイド](./docs/SETUP_GUIDE.md)
 - [プロジェクト README](../README.md)
 - [要件定義](../docs/requirements.md)
+
+## Git 設定の共有 🔧
+
+### 自動設定機能
+
+DevContainer 起動時に、ホストマシンの Git 設定が自動的にコンテナ内に同期されます：
+
+1. **ホストの Git 設定コピー**: `~/.gitconfig` の内容をコンテナ内に適用
+2. **SSH Agent 転送**: ホストの SSH 鍵をコンテナ内で使用可能
+3. **Git 認証情報共有**: VS Code が自動的にホストの認証情報を共有
+
+### Git 設定の確認
+
+```bash
+# Git設定の確認
+make git-status
+
+# 出力例:
+🔍 Git設定を確認中...
+Git Version: git version 2.34.1
+User Name: Your Name
+User Email: your.email@example.com
+Core Editor: code --wait
+Default Branch: main
+Credential Helper: store
+SSH Agent: 利用可能
+SSH Keys: 2 個のキーが利用可能
+```
+
+### Git 設定のトラブルシューティング
+
+#### 🚨 問題 1: Git 設定が見つからない
+
+```bash
+# 症状
+User Name: 未設定
+User Email: 未設定
+
+# 解決方法1: 手動設定
+make git-setup
+
+# 解決方法2: 直接設定
+git config --global user.name "Your Name"
+git config --global user.email "your.email@example.com"
+```
+
+#### 🚨 問題 2: SSH Agent が利用できない
+
+```bash
+# 症状
+SSH Agent: 利用不可
+
+# 解決方法（ホストマシンで実行）:
+# 1. SSH Agentを起動
+eval "$(ssh-agent -s)"
+
+# 2. SSH鍵を追加
+ssh-add ~/.ssh/id_rsa  # または該当する鍵
+
+# 3. VS Codeを再起動
+```
+
+#### 🚨 問題 3: Git 認証に失敗する
+
+```bash
+# HTTPSの場合
+git config --global credential.helper store
+
+# SSHの場合
+ssh -T git@github.com  # GitHub接続テスト
+```
+
+### Git 設定コマンド
+
+```bash
+# Git設定確認
+make git-status
+
+# Git設定を対話的に設定
+make git-setup
+
+# Git設定をリセット
+make git-reset
+```
+
+## 使用方法
+
+### 初回セットアップ
+
+1. **VS Code 拡張機能のインストール**
+
+   - Dev Containers 拡張機能をインストール
+
+2. **プロジェクトを開く**
+
+   ```bash
+   # リポジトリクローン
+   git clone https://github.com/your-org/webapi-template-cursor.git
+   cd webapi-template-cursor
+
+   # VS Codeで開く
+   code .
+   ```
+
+3. **DevContainer で開く**
+
+   - VS Code で「Reopen in Container」を選択
+   - 初回は 5-10 分程度の構築時間が必要
+
+4. **Git 設定確認**
+   ```bash
+   make git-status
+   ```
+
+### 日常の開発
+
+```bash
+# 開発サーバー起動
+make dev
+
+# テスト実行
+make test
+
+# Git設定確認
+make git-status
+
+# コミット
+git add .
+git commit -m "feat: new feature"
+git push
+```
+
+## 自動化された機能
+
+### セットアップスクリプト
+
+DevContainer 起動時に以下が自動実行されます：
+
+1. ✅ Go 環境・ツールのセットアップ
+2. ✅ Git 設定の同期・確認
+3. ✅ プロジェクト依存関係の解決
+4. ✅ Git Hooks の設定
+5. ✅ ファイル権限の設定
+6. ✅ 開発環境の健全性確認
+
+### Git Hooks の自動設定
+
+以下の Git Hooks が自動設定されます：
+
+- **pre-commit**: コードフォーマット・リント実行
+- **pre-push**: テスト実行
+
+```bash
+# Git Hooks を手動で再設定
+./scripts/setup-hooks.sh
+```
+
+## 高度な使用方法
+
+### 追加ツールのインストール
+
+```bash
+# 開発ツール一括インストール（時間がかかります）
+make install-tools
+```
+
+含まれるツール：
+
+- golangci-lint (リンター)
+- air (ホットリロード)
+- migrate (DB マイグレーション)
+- mockery (モック生成)
+
+### データベース操作
+
+```bash
+# データベース接続確認
+make db-status
+
+# CockroachDB CLIに接続
+cockroach sql --insecure --host=cockroachdb
+```
+
+### API ドキュメント生成
+
+```bash
+# Swagger ドキュメントを生成
+make swagger
+
+# Swagger UI: http://localhost:8081
+```
+
+## トラブルシューティング
+
+### よくある問題
+
+#### 1. コンテナ起動が遅い
+
+- **原因**: 初回構築・大きなイメージ
+- **解決**: 軽量化された Dockerfile を使用済み
+
+#### 2. ポート競合
+
+- **原因**: ホストで同じポートを使用中
+- **解決**: `devcontainer.json`でポート変更
+
+#### 3. Git 設定が同期されない
+
+- **原因**: ホストに`.gitconfig`が存在しない
+- **解決**: `make git-setup`で手動設定
+
+#### 4. メモリ不足
+
+- **原因**: Docker のメモリ制限
+- **解決**: Docker Desktop でメモリ増加
+
+### ログの確認
+
+```bash
+# DevContainer構築ログ
+# VS Code: View → Output → Dev Containers
+
+# アプリケーションログ
+make dev  # 開発サーバーのログを表示
+```
+
+## セキュリティ考慮事項
+
+### 含まれるもの
+
+- ✅ Git 設定の安全な共有
+- ✅ SSH Agent 転送
+- ✅ 認証情報の自動管理
+
+### 含まれないもの
+
+- ❌ Secret ファイルの共有（`.env`等は手動設定）
+- ❌ プライベート鍵のコピー（転送のみ）
+
+## サポート
+
+### 問題の報告
+
+1. `make git-status` の出力を確認
+2. DevContainer 構築ログを確認
+3. Issue テンプレートで報告
+
+### 設定変更
+
+- `devcontainer.json`: VS Code・ポート設定
+- `docker-compose.yml`: サービス設定
+- `Dockerfile`: 開発環境パッケージ
+- `scripts/setup.sh`: 初期化ロジック
+
+---
+
+**Note**: この DevContainer 設定は、WebAPI 開発のベストプラクティスに基づいて構築されています。追加の要件がある場合は、設定ファイルを適切に修正してください。

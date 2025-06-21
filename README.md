@@ -31,9 +31,31 @@ cd webapi-template-cursor
 ```bash
 make help           # 利用可能なコマンドを確認
 make setup-hooks    # Git Hooksを設定（必須）
+make git-status     # Git設定を確認
 ```
 
 > **⚠️ 重要**: 初回セットアップ時は `make setup-hooks` を実行してください。これにより、コミット前に自動的にコード品質チェックが実行されます。
+
+### 4. Git 設定の確認
+
+DevContainer では、ホストマシンの Git 設定が自動的に同期されます：
+
+```bash
+# Git設定の確認
+make git-status
+
+# Git設定が不完全な場合は手動設定
+make git-setup
+```
+
+Git コミットが正常に動作することを確認：
+
+```bash
+git add .
+git commit -m "test: initial commit"
+```
+
+> 詳細な Git 設定については [.devcontainer/README.md](.devcontainer/README.md) を参照してください。
 
 ## 🛠️ 技術スタック
 
@@ -89,6 +111,11 @@ make swagger             # Swagger ドキュメントを生成
 # Docker
 make docker-build        # Docker イメージをビルド
 make docker-run          # Docker コンテナを実行
+
+# Git設定
+make git-status          # Git設定を確認
+make git-setup           # Git設定を対話的に設定
+make git-reset           # Git設定をリセット
 
 # その他
 make clean               # 生成ファイルを削除

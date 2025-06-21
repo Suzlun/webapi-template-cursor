@@ -68,7 +68,7 @@ install_go_tool() {
             log_success "$tool_name インストール完了"
         else
             log_warning "$tool_name のインストールに失敗"
-        fi
+fi
     fi
 }
 
@@ -152,15 +152,101 @@ else
     log_warning "Redis CLI が見つかりません"
 fi
 
-# 7. 環境変数の設定確認
-log_section "7. 環境変数の確認"
+# 7. Git設定の確認・同期
+log_section "7. Git設定の確認・同期"
+
+# Git設定の確認
+log_info "Git設定を確認中..."
+
+# Git version
+if command -v git >/dev/null 2>&1; then
+    GIT_VERSION=$(git --version)
+    log_success "Git確認: $GIT_VERSION"
+else
+    log_error "Gitが見つかりません"
+    exit 1
+fi
+
+# ホストのGit設定を確認・設定
+setup_git_config() {
+    log_info "Git設定の初期化を実行中..."
+    
+    # Git設定の確認
+    GIT_USER_NAME=$(git config --global user.name 2>/dev/null || echo "")
+    GIT_USER_EMAIL=$(git config --global user.email 2>/dev/null || echo "")
+    
+    if [[ -z "$GIT_USER_NAME" || -z "$GIT_USER_EMAIL" ]]; then
+        log_warning "Git設定が不完全です"
+        
+        # ホストのGit設定をコピー（可能な場合）
+        if [[ -f "/tmp/.gitconfig-host" ]]; then
+            log_info "ホストのGit設定を適用中..."
+            cp /tmp/.gitconfig-host ~/.gitconfig
+            log_success "ホストのGit設定を適用しました"
+        else
+            log_warning "Git設定が見つかりません"
+            log_info "手動でGit設定を行ってください:"
+            echo "  git config --global user.name \"Your Name\""
+            echo "  git config --global user.email \"your.email@example.com\""
+        fi
+    else
+        log_success "Git設定確認済み:"
+        echo "  User: $GIT_USER_NAME"
+        echo "  Email: $GIT_USER_EMAIL"
+    fi
+    
+    # Git認証情報の確認
+    if git config --list | grep -q credential.helper; then
+        log_success "Git credential helper 設定済み"
+    else
+        log_info "Git credential helper を設定中..."
+        git config --global credential.helper store
+        log_success "Git credential helper 設定完了"
+    fi
+    
+    # SSH Agent の確認
+    if [[ -n "$SSH_AUTH_SOCK" ]]; then
+        log_success "SSH Agent 利用可能"
+        if ssh-add -l >/dev/null 2>&1; then
+            SSH_KEYS_COUNT=$(ssh-add -l | wc -l)
+            log_success "SSH Keys: $SSH_KEYS_COUNT 個のキーが利用可能"
+        else
+            log_info "SSH Keys: キーが読み込まれていません"
+        fi
+    else
+        log_warning "SSH Agent が見つかりません"
+        log_info "SSH認証を使用する場合、ホストでSSH Agentを起動し、"
+        log_info "VS CodeでSSH Agent Forwardingを有効にしてください"
+    fi
+    
+    # Git設定の表示
+    log_info "現在のGit設定:"
+    echo "  Core Editor: $(git config --global core.editor || echo "未設定")"
+    echo "  Default Branch: $(git config --global init.defaultBranch || echo "未設定")"
+    echo "  Push Default: $(git config --global push.default || echo "未設定")"
+    echo "  Pull Rebase: $(git config --global pull.rebase || echo "未設定")"
+    
+    # 基本的なGit設定の推奨値を設定
+    git config --global init.defaultBranch main || true
+    git config --global push.default simple || true
+    git config --global pull.rebase false || true
+    git config --global core.autocrlf input || true
+    git config --global core.editor "code --wait" || true
+    
+    log_success "Git基本設定完了"
+}
+
+setup_git_config
+
+# 8. 環境変数の設定確認
+log_section "8. 環境変数の確認"
 
 if [[ -f ".env.example" ]]; then
     if [[ ! -f ".env" ]]; then
         log_info ".env.example から .env をコピー中..."
         cp .env.example .env
         log_success ".env ファイル作成完了"
-    else
+else
         log_success ".env ファイル 既存"
     fi
 else
