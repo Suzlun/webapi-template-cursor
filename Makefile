@@ -2,7 +2,7 @@
 # WebAPI Template - Makefile
 # =============================================================================
 
-.PHONY: help dev build test clean install-tools
+.PHONY: help dev build test clean install-tools setup-hooks
 
 # デフォルトターゲット
 .DEFAULT_GOAL := help
@@ -39,6 +39,10 @@ install-tools: ## 開発ツールをインストール（時間がかかりま�
 	go install github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 	go install github.com/vektra/mockery/v2@latest
 	@echo "✅ ツールのインストール完了"
+
+# Git Hooks
+setup-hooks: ## Git Hooksを設定（全チームメンバー必須）
+	./scripts/setup-hooks.sh
 
 # 品質チェック（golangci-lintがインストール済みの場合）
 lint: ## golangci-lintを実行

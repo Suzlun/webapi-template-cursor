@@ -3,10 +3,10 @@
 # =============================================================================
 
 # 軽量化されたDevContainer - 素早い起動を優先
-FROM golang:1.24-bullseye AS base
+FROM golang:1.24-bookworm AS base
 
 # 基本的なシステムパッケージのインストール
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     curl \
     wget \
     git \

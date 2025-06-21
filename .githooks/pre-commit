@@ -1,0 +1,112 @@
+#!/bin/bash
+
+# =============================================================================
+# Git Pre-commit Hook
+# コミット前に自動実行される品質チェック・コード整形
+# =============================================================================
+
+set -e
+
+# カラー出力定義
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# ログ出力関数
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Goファイルが変更されているかチェック
+if ! git diff --cached --name-only | grep -q '\.go$'; then
+    log_info "Goファイルの変更がないため、スキップします"
+    exit 0
+fi
+
+log_info "=== Git Pre-commit Hook開始 ==="
+
+# 1. go mod tidy
+log_info "1. go mod tidy を実行中..."
+if go mod tidy; then
+    log_success "go mod tidy 完了"
+else
+    log_error "go mod tidy に失敗しました"
+    exit 1
+fi
+
+# 2. コード整形 (gofmt + goimports)
+log_info "2. コード整形を実行中..."
+
+# gofmt -s -w (簡略化 + 書き込み)
+if command -v gofmt >/dev/null 2>&1; then
+    gofmt -s -w .
+    log_success "gofmt 完了"
+else
+    log_warning "gofmt が見つかりません"
+fi
+
+# goimports (import整理)
+if command -v goimports >/dev/null 2>&1; then
+    goimports -w .
+    log_success "goimports 完了"
+else
+    log_warning "goimports が見つかりません (インストール推奨: go install golang.org/x/tools/cmd/goimports@latest)"
+fi
+
+# 3. リンター実行
+log_info "3. golangci-lint を実行中..."
+
+if command -v golangci-lint >/dev/null 2>&1; then
+    if golangci-lint run --timeout=5m; then
+        log_success "golangci-lint 完了"
+    else
+        log_error "golangci-lint でエラーが検出されました"
+        log_error "修正してから再度コミットしてください"
+        exit 1
+    fi
+else
+    log_warning "golangci-lint が見つかりません"
+    log_warning "インストール推奨: https://golangci-lint.run/usage/install/"
+fi
+
+# 4. テスト実行（変更されたファイルのみ）
+log_info "4. 簡易テストを実行中..."
+
+if go test -short ./... >/dev/null 2>&1; then
+    log_success "テスト完了"
+else
+    log_error "テストが失敗しました"
+    log_error "修正してから再度コミットしてください"
+    exit 1
+fi
+
+# 5. 整形されたファイルを再度ステージングに追加
+log_info "5. 整形されたファイルをステージングに追加中..."
+
+# 変更されたGoファイルのみを再ステージング
+git diff --cached --name-only | grep '\.go$' | xargs git add
+
+# go.mod, go.sumが変更された場合は追加
+if [[ -n $(git diff go.mod go.sum 2>/dev/null) ]]; then
+    git add go.mod go.sum
+    log_info "go.mod, go.sum をステージングに追加"
+fi
+
+log_success "=== Pre-commit Hook完了 ==="
+log_info "コミットを続行します..."
+
+exit 0 

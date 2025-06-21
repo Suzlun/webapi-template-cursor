@@ -29,8 +29,11 @@ cd webapi-template-cursor
 コンテナが立ち上がったら、ターミナルで以下を実行：
 
 ```bash
-make help  # 利用可能なコマンドを確認
+make help           # 利用可能なコマンドを確認
+make setup-hooks    # Git Hooksを設定（必須）
 ```
+
+> **⚠️ 重要**: 初回セットアップ時は `make setup-hooks` を実行してください。これにより、コミット前に自動的にコード品質チェックが実行されます。
 
 ## 🛠️ 技術スタック
 
@@ -72,6 +75,7 @@ make test-coverage       # カバレッジ付きでテストを実行
 # 品質チェック
 make lint                # golangci-lintを実行
 make fmt                 # コードフォーマット
+make setup-hooks         # Git Hooksを設定（初回必須）
 
 # データベース
 make db-create           # データベースを作成
